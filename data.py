@@ -67,8 +67,8 @@ def prepare_data(batch_size: int, rank: int, world_size: int):
         eval_loader: DataLoader for evaluation dataset.
     """
     raw_dataset = get_dataset()
-    raw_dataset["train"] = raw_dataset["train"].shuffle(seed=42).select(range(100))
-    raw_dataset["test"] = raw_dataset["test"].shuffle(seed=42).select(range(50))
+    raw_dataset["train"] = raw_dataset["train"].shuffle(seed=42).select(range(32))
+    raw_dataset["test"] = raw_dataset["test"].shuffle(seed=42).select(range(16))
     tokenized_dataset = tokenize_data(raw_dataset)
     train_ds, eval_ds = split_dataset(tokenized_dataset)
 

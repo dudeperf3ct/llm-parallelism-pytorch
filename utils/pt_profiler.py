@@ -12,14 +12,10 @@ def pt_profiler(profiler_path, steps):
     tensorboard_handler = torch.profiler.tensorboard_trace_handler(
         str(file_path), worker_name=f"worker_{rank}", use_gzip=True
     )
-    sort_by_keyword = "self_cuda_time_total"
 
     def trace_handler(prof):
         # Saves the profiler trace to a file
         tensorboard_handler(prof)
-        prof.export_chrome_trace(f"{file_path}_trace.json")
-        output = prof.key_averages().table(sort_by=sort_by_keyword, row_limit=-1)
-        print(output)
 
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     # wait: how many steps to wait before starting to record
@@ -34,4 +30,4 @@ def pt_profiler(profiler_path, steps):
         with_stack=True,
         profile_memory=True,
     )
-    return profiler #noqa
+    return profiler  # noqa

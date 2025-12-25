@@ -8,7 +8,7 @@ from model import get_model
 from utils.ddp_utils import ddp_cleanup, ddp_initialize, get_dist_info
 from utils.train_utils import set_seed, train_loop
 
-GLOBAL_BATCH_SIZE = 128
+GLOBAL_BATCH_SIZE = 8
 
 parser = argparse.ArgumentParser(description="Distributed Training Example")
 parser.add_argument(
