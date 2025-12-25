@@ -8,8 +8,7 @@ from model import get_model
 from utils.ddp_utils import ddp_cleanup, ddp_initialize, get_dist_info
 from utils.train_utils import set_seed, train_loop
 
-GLOBAL_BATCH_SIZE = 1024
-
+GLOBAL_BATCH_SIZE = 128
 
 parser = argparse.ArgumentParser(description="Distributed Training Example")
 parser.add_argument(
@@ -18,8 +17,6 @@ parser.add_argument(
 args = parser.parse_args()
 
 if __name__ == "__main__":
-    print(f"Global batch size: {GLOBAL_BATCH_SIZE}")
-
     set_seed(42)
     ddp_initialize()
     rank, world_size, local_rank = get_dist_info()
@@ -27,8 +24,11 @@ if __name__ == "__main__":
     print(f"Rank: {rank}, World Size: {world_size}, Local Rank: {local_rank}")
     device = torch.device(f"cuda:{local_rank}")
 
-    print(f"Number of devices: {world_size}")
-    print(f"Number of batches per device: {PER_DEVICE_BATCH_SIZE}")
+    if local_rank == 0:
+        print(f"Number of devices: {world_size}")
+        print(f"Global batch size: {GLOBAL_BATCH_SIZE}")
+        print(f"Number of batches per device: {PER_DEVICE_BATCH_SIZE}")
+
     print(f"Preparing data on rank {rank}...")
     train_loader, eval_loader = prepare_data(PER_DEVICE_BATCH_SIZE, rank, world_size)
     model = get_model()
@@ -43,6 +43,7 @@ if __name__ == "__main__":
 
     optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
     profile_dir = f"profile/{args.ddp_choice}"
+    print(f"Training started on rank {rank}...")
     train_loop(model, train_loader, optim, device=device, epochs=10, profile_dir=profile_dir)
 
     ddp_cleanup()

@@ -22,7 +22,7 @@ def set_seed(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def train_loop(model, data, optimizer, device, epochs, profile_dir): # noqa
+def train_loop(model, data, optimizer, device, epochs, profile_dir):  # noqa
     """Train a model while logging timing stats for each batch and epoch.
 
     Args:
@@ -42,6 +42,13 @@ def train_loop(model, data, optimizer, device, epochs, profile_dir): # noqa
     model.train()
     profiler_cm = pt_profiler(profile_dir, epochs - 3)
 
+    # Use CUDA events for GPU timings without forcing full device syncs.
+    if log_on_rank0:
+        move_start_event = torch.cuda.Event(enable_timing=True)
+        move_end_event = torch.cuda.Event(enable_timing=True)
+        batch_start_event = torch.cuda.Event(enable_timing=True)
+        batch_end_event = torch.cuda.Event(enable_timing=True)
+
     with profiler_cm as profiler:
         for epoch in range(epochs):
             data.sampler.set_epoch(epoch)
@@ -50,12 +57,17 @@ def train_loop(model, data, optimizer, device, epochs, profile_dir): # noqa
             epoch_batch_times = []
 
             for batch_idx, batch in enumerate(data, start=1):
-                batch_start = time.perf_counter()
+                move_time = 0.0
+                batch_time = 0.0
 
-                move_start = time.perf_counter()
-                batch = {k: v.to(device) for k, v in batch.items()} #noqa
-                torch.cuda.synchronize(device)
-                move_time = time.perf_counter() - move_start
+                if log_on_rank0:
+                    batch_start_event.record()
+                    move_start_event.record()
+
+                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}  # noqa
+
+                if log_on_rank0:
+                    move_end_event.record()
 
                 optimizer.zero_grad(set_to_none=True)
                 outputs = model(**batch)
@@ -68,11 +80,15 @@ def train_loop(model, data, optimizer, device, epochs, profile_dir): # noqa
 
                 optimizer.step()
 
-                torch.cuda.synchronize(device)
-                batch_time = time.perf_counter() - batch_start
+                if log_on_rank0:
+                    batch_end_event.record()
+                    batch_end_event.synchronize()
+                    move_time = move_start_event.elapsed_time(move_end_event) / 1000.0
+                    batch_time = batch_start_event.elapsed_time(batch_end_event) / 1000.0
 
-                epoch_move_times.append(move_time)
-                epoch_batch_times.append(batch_time)
+                if log_on_rank0:
+                    epoch_move_times.append(move_time)
+                    epoch_batch_times.append(batch_time)
                 total_batches += 1
 
                 profiler.step()

@@ -10,6 +10,8 @@ Write up:
 - Multiple GPUs
 - uv
 
+I used a 2 x Nvidia L40 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $2/hour as of December 2025.
+
 ## Setup
 
 ```bash
