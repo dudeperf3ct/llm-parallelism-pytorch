@@ -30,8 +30,11 @@ def train_step(batch, model, optimizer):
     loss = outputs.loss
     loss.backward()
 
+    # If we are using PyTorch's DDP, we don't need to include this step
+    # as it uses backward hook to automatically register and bucket gradients
     # Important step for SimpleDDP to sync gradients
-    model.sync_gradients()
+    if hasattr(model, "sync_gradients"):
+        model.sync_gradients()
 
     optimizer.step()
     return model, optimizer, loss
@@ -53,7 +56,8 @@ def train_step_with_hook_ga_async(  # noqa
     # Perform backward and optimizer step based on accumulation
     if should_sync and not is_hook and not is_async:
         loss.backward()
-        model.sync_gradients()
+        if hasattr(model, "sync_gradients"):
+            model.sync_gradients()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
     elif should_sync and is_hook and not is_async:

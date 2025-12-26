@@ -21,7 +21,13 @@ uv sync
 
 ## Run (multi-GPU only)
 
-`torchrun` sets up the distributed environment variables for you.
+To run all implemented strategies in one go:
+
+```bash
+./run_experiment.sh 4
+```
+
+Following sections describe how to run each strategy individually. The `torchrun` CLI sets up the distributed environment variables for you.
 
 ```bash
 # Choose how many GPUs to use on the node
@@ -34,11 +40,11 @@ Notes:
 - `GLOBAL_BATCH_SIZE` (8) is split across ranks; adjust it if you change `NUM_GPUS` or use GPUs with larger memory.
 - Profiler traces land under `profile/<ddp_choice>/rank_<rank>/`.
 - Logs print only on rank 0
-- You can change `--ddp-choice` to try different strategies: `simple_ddp`, `pytorch_ddp`.
+- You can change `--ddp-choice` to try different strategies: `simple_ddp`, `simple_ddp_ga`, `simple_ddp_hook`, `simple_ddp_async`, `bucket_ddp_async`, `pytorch_ddp`.
 
 ## Trace Analysis
 
-Analyze PyTorch profiler traces with Holistic Trace Analysis (HTA). The script generates a single HTML dashboard and a compact CSV summary.
+Analyze PyTorch profiler traces with [Holistic Trace Analysis](https://github.com/facebookresearch/HolisticTraceAnalysis) (HTA) library. The script generates a single HTML dashboard and a compact CSV summary.
 
 ```bash
 python scripts/analyze_traces.py --trace-dir profile/simple_ddp --select latest

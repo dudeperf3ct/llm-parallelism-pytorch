@@ -1,6 +1,7 @@
 import argparse
 
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from data import prepare_data
 from ddp.bucket_ddp_async import BucketDDPAsyncHookGA
@@ -27,6 +28,7 @@ parser.add_argument(
         "simple_ddp_hook",
         "simple_ddp_async",
         "bucket_ddp_async",
+        "pytorch_ddp",
     ],
     default="simple_ddp",
 )
@@ -72,6 +74,9 @@ if __name__ == "__main__":
         grad_accum_steps = GRAD_ACCUM_STEPS
         is_async = True
         is_hook = True
+    elif args.ddp_choice == "pytorch_ddp":
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        grad_accum_steps = None
 
     optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
     profile_dir = f"profile/{args.ddp_choice}"
