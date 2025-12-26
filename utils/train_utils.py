@@ -191,7 +191,9 @@ def train_loop(  # noqa
                 )
 
             # Handle any remaining gradients for gradient accumulation for both cases.
-            # For async, there are no outstanding async handles on this tail; we do a blocking reduction.
+            # For async, there are no outstanding async handles on this tail
+            # we use SimpleDDPAsyncHookGA sync_gradients to flush them.
+            # Similarly for BucketDDPAsyncHookGA, we call sync_gradients to flush remaining grads.
             if (
                 grad_accum_steps is not None
                 and last_batch_idx % grad_accum_steps != 0

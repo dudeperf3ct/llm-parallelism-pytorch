@@ -3,6 +3,7 @@ import argparse
 import torch
 
 from data import prepare_data
+from ddp.bucket_ddp_async import BucketDDPAsyncHookGA
 from ddp.simple_ddp import SimpleDDP
 from ddp.simple_ddp_async import SimpleDDPAsyncHookGA
 from ddp.simple_ddp_ga import SimpleDDPWithGA
@@ -20,7 +21,13 @@ parser = argparse.ArgumentParser(description="Distributed Training Example")
 parser.add_argument(
     "--ddp-choice",
     type=str,
-    choices=["simple_ddp", "simple_ddp_ga", "simple_ddp_hook", "simple_ddp_async"],
+    choices=[
+        "simple_ddp",
+        "simple_ddp_ga",
+        "simple_ddp_hook",
+        "simple_ddp_async",
+        "bucket_ddp_async",
+    ],
     default="simple_ddp",
 )
 args = parser.parse_args()
@@ -57,6 +64,11 @@ if __name__ == "__main__":
         grad_accum_steps = None
     elif args.ddp_choice == "simple_ddp_async":
         model = SimpleDDPAsyncHookGA(model)
+        grad_accum_steps = GRAD_ACCUM_STEPS
+        is_async = True
+        is_hook = True
+    elif args.ddp_choice == "bucket_ddp_async":
+        model = BucketDDPAsyncHookGA(model)
         grad_accum_steps = GRAD_ACCUM_STEPS
         is_async = True
         is_hook = True

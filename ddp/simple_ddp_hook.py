@@ -10,27 +10,25 @@ class SimpleDDPHookGA(SimpleDDPWithGA):
     The flow is:
     - `register_backward_hook` registers `self._sync_gradient` on each `Parameter`.
     - During backward, once a param’s grad is fully accumulated,
-      PyTorch invokes the hook with that grad tensor.
-    - `_sync_gradient` runs in-place on that tensor, `all_reduce`s, and divides by `world_size`,
+      PyTorch invokes the hook with the parameter.
+    - `_sync_gradient` runs on `param.grad`, `all_reduce`s, and divides by `world_size`,
       so `p.grad` ends up averaged across ranks.
     """
 
     def __init__(self, model: torch.nn.Module):
         super().__init__(model)
-        self.register_backward_hook()
+        self.register_ga_hook()
 
-    def _sync_gradient(self, grad):
-        """Hook called after a param's grad is accumulated.
-        `grad` is the actual gradient tensor (same storage as param.grad).
-        """
-        if not self.should_sync or grad is None:
+    def _sync_gradient(self, param):
+        """Hook called after a param's grad is accumulated."""
+        if not self.should_sync or param.grad is None:
             return
 
         # Sum the gradient across all ranks and then average.
-        dist.all_reduce(grad, op=dist.ReduceOp.SUM)
-        grad /= self.world_size
+        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        param.grad /= self.world_size
 
-    def register_backward_hook(self):
+    def register_ga_hook(self):
         # Keep track of hooks to remove them later if needed.
         self.sync_hooks = []
         for p in self.model.parameters():
