@@ -203,3 +203,6 @@ __marimo__/
 
 # Profile directory
 profile
+
+# Trace analysis reports
+reports

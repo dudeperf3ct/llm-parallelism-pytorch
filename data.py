@@ -81,6 +81,7 @@ def prepare_data(batch_size: int, rank: int, world_size: int):
     num_workers = min(8, os.cpu_count() // max(1, world_size))
     use_workers = num_workers > 0
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+    eval_sampler = DistributedSampler(eval_ds, num_replicas=world_size, rank=rank, shuffle=False)
     train_loader = DataLoader(
         train_ds,
         shuffle=False,
@@ -95,6 +96,7 @@ def prepare_data(batch_size: int, rank: int, world_size: int):
     eval_loader = DataLoader(
         eval_ds,
         batch_size=batch_size,
+        sampler=eval_sampler,
         pin_memory=True,
         collate_fn=collator,
         num_workers=num_workers,

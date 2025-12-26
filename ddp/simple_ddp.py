@@ -6,7 +6,6 @@ from utils.ddp_utils import get_dist_info
 
 class SimpleDDP(torch.nn.Module):
     def __init__(self, model: torch.nn.Module):
-        """Lightweight DDP wrapper with manual param and grad sync."""
         super().__init__()
         self.model = model
         self.rank, self.world_size, self.local_rank = get_dist_info()
