@@ -112,7 +112,8 @@ def train_loop(  # noqa
     total_start = time.perf_counter()
 
     model.train()
-    profiler_cm = pt_profiler(profile_dir, epochs - 3)
+    active_steps = min(10, len(data))
+    profiler_cm = pt_profiler(profile_dir, active_steps)
 
     # Use CUDA events for GPU timings without forcing full device syncs.
     if log_on_rank0:
@@ -167,6 +168,7 @@ def train_loop(  # noqa
                     epoch_batch_times.append(batch_time)
                 total_batches += 1
 
+                # Take a profiler step after every batch
                 profiler.step()
 
                 if log_on_rank0:

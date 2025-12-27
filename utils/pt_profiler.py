@@ -5,7 +5,15 @@ import torch
 from .ddp_utils import get_dist_info
 
 
-def pt_profiler(profiler_path, steps):
+def pt_profiler(profiler_path, active_steps, wait_steps=1, warmup_steps=2, repeat=1):
+    """PyTorch profiler to trace kernels, compute and comm overheads.
+
+    Quick intuition for choosing these:
+    - `wait`: 1–2 steps (skip startup oddities)
+    - `warmup`: 1–2 steps (let kernels settle)
+    - `active`: 8–20 steps for a stable view, smaller if profiling overhead is too heavy
+    - `repeat`: how many trace files per rank you want
+    """
     rank, world_size, local_rank = get_dist_info()
     file_path = Path(profiler_path) / f"rank_{rank}"
     Path.mkdir(file_path, exist_ok=True, parents=True)
@@ -21,7 +29,11 @@ def pt_profiler(profiler_path, steps):
     # wait: how many steps to wait before starting to record
     # warmup: how many steps to warm up before active profiling
     # active: how many steps to actively profile
-    schedule = torch.profiler.schedule(wait=1, warmup=2, active=steps)
+    # Cycle length = wait + warmup + active
+    # Ensure `wait + warmup + active <= total_steps` (total_steps = `epochs * len(data)`).
+    schedule = torch.profiler.schedule(
+        wait=wait_steps, warmup=warmup_steps, active=active_steps, repeat=repeat
+    )
     profiler = torch.profiler.profile(
         schedule=schedule,
         activities=activities,
