@@ -13,9 +13,9 @@ from model import get_model
 from utils.ddp_utils import ddp_cleanup, ddp_initialize, get_dist_info
 from utils.train_utils import evaluate, set_seed, train_loop
 
-GLOBAL_BATCH_SIZE = 8
+GLOBAL_BATCH_SIZE = 14
 EPOCHS = 10
-GRAD_ACCUM_STEPS = 2
+GRAD_ACCUM_STEPS = 4
 SEED = 42
 
 parser = argparse.ArgumentParser(description="Distributed Training Example")
@@ -81,7 +81,7 @@ if __name__ == "__main__":
     optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
     profile_dir = f"profile/{args.ddp_choice}"
     print(f"Training started on rank {rank}...")
-    train_loop(
+    model = train_loop(
         model,
         train_loader,
         optim,

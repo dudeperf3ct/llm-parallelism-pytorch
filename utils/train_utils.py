@@ -222,6 +222,7 @@ def train_loop(  # noqa
             f"Training completed in {total_time:.3f}s across {total_batches} batches "
             f"(avg {avg_time_per_batch:.3f}s per batch)"
         )
+    return model
 
 
 def evaluate(model, data_loader, device):
