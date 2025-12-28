@@ -2,7 +2,7 @@
 
 Implement and compare various data parallelism strategies on Yelp Review Full using `HuggingFaceTB/SmolLM2-360M-Instruct`.
 
-Write up: 
+Data Parallelism Write up: https://dudeperf3ct.github.io/posts/implement_data_parallelism/
 
 ## Requirements
 
