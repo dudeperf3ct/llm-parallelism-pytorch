@@ -55,3 +55,6 @@ By default, the output directory is inferred by replacing `profile/` with `repor
 Optional flags:
 - `--select all` to analyze each trace window and save under `reports/<name>/run_<idx>_<ts>/`.
 - `--enable-multiprocessing` to parse traces with multiprocessing.
+
+>[!NOTE]
+> Each experiment produces a trace file for each rank that can be viewed at [perfetto UI](https://ui.perfetto.dev/). This provides detailed breakdown of CUDA streams and CPU threads. It shows the compute time for all the operations taking place on GPU and CPU.
