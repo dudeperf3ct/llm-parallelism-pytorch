@@ -17,7 +17,7 @@ class BucketDDPAsyncHookGA(torch.nn.Module):
       remaining partial bucket and wait for all reductions to complete.
 
     A major concern here is we are building bucket on each ranky by hook firing order
-    Hook order can differ aross each rank, so flat buffers line up different parameters
+    Hook order can differ across each rank, so flat buffers line up different parameters
     on different ranks. The all-reduce then sums mismatched params and might corrupt grads silently.
     """
 

@@ -37,9 +37,9 @@ args = parser.parse_args()
 if __name__ == "__main__":
     set_seed(SEED)
     ddp_initialize()
-    rank, world_size, local_rank = get_dist_info()
+    global_rank, world_size, local_rank = get_dist_info()
     per_device_batch = GLOBAL_BATCH_SIZE // world_size
-    print(f"Rank: {rank}, World Size: {world_size}, Local Rank: {local_rank}")
+    print(f"Rank: {global_rank}, World Size: {world_size}, Local Rank: {local_rank}")
     device = torch.device(f"cuda:{local_rank}")
 
     if local_rank == 0:
@@ -47,8 +47,8 @@ if __name__ == "__main__":
         print(f"Global batch size: {GLOBAL_BATCH_SIZE}")
         print(f"Number of batches per device: {per_device_batch}")
 
-    print(f"Preparing data on rank {rank}...")
-    train_loader, eval_loader = prepare_data(per_device_batch, rank, world_size)
+    print(f"Preparing data on rank {global_rank}...")
+    train_loader, eval_loader = prepare_data(per_device_batch, local_rank, world_size)
     model = get_model()
     model.to(device)
 
@@ -80,7 +80,7 @@ if __name__ == "__main__":
 
     optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
     profile_dir = f"profile/{args.ddp_choice}"
-    print(f"Training started on rank {rank}...")
+    print(f"Training started on rank {local_rank}...")
     model = train_loop(
         model,
         train_loader,
