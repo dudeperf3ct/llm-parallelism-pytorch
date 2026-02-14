@@ -6,7 +6,12 @@ import torch
 import torch.distributed as dist
 
 from .ddp_utils import get_dist_info
-from .memory_utils import print_memory_stats
+from .memory_utils import (
+    get_gradient_memory,
+    get_model_memory,
+    get_optimizer_memory,
+    print_memory_stats,
+)
 from .pt_profiler import pt_profiler
 
 
@@ -91,6 +96,8 @@ def train_loop(  # noqa
     grad_accum_steps=None,
     is_async=False,
     is_hook=False,
+    log_memory_before_after=False,
+    memory_log_interval=0,
 ):
     """Train a model while logging timing stats for each batch and epoch.
 
@@ -104,6 +111,8 @@ def train_loop(  # noqa
         grad_accum_steps: Number of steps for gradient accumulation (optional).
         is_async: Whether to use asynchronous gradient synchronization (optional).
         is_hook: Whether to use hook-based gradient synchronization (optional).
+        log_memory_before_after: Log per-batch memory before/after the train step on rank 0.
+        memory_log_interval: Log every N batches when memory logging is enabled.
     """
     rank, _, _ = get_dist_info()
     log_on_rank0 = rank == 0
@@ -134,6 +143,12 @@ def train_loop(  # noqa
                 last_batch_idx = batch_idx
                 move_time = 0.0
                 batch_time = 0.0
+                log_step_memory = (
+                    log_on_rank0
+                    and log_memory_before_after
+                    and memory_log_interval > 0
+                    and batch_idx % memory_log_interval == 0
+                )
 
                 if log_on_rank0:
                     batch_start_event.record()
@@ -143,6 +158,12 @@ def train_loop(  # noqa
 
                 if log_on_rank0:
                     move_end_event.record()
+
+                if log_step_memory:
+                    pre_model_memory = get_model_memory(model)
+                    pre_grad_memory = get_gradient_memory(model)
+                    pre_optim_memory = get_optimizer_memory(optimizer)
+                    pre_allocated = torch.cuda.memory_allocated(device) / 1024**2
 
                 if grad_accum_steps is not None:
                     model, optimizer, loss = train_step_with_hook_ga_async(
@@ -156,6 +177,19 @@ def train_loop(  # noqa
                     )
                 else:
                     model, optimizer, loss = train_step(batch, model, optimizer)
+
+                if log_step_memory:
+                    post_model_memory = get_model_memory(model)
+                    post_grad_memory = get_gradient_memory(model)
+                    post_optim_memory = get_optimizer_memory(optimizer)
+                    post_allocated = torch.cuda.memory_allocated(device) / 1024**2
+                    print(
+                        f"[Batch {batch_idx}] memory pre->post (MB): "
+                        f"model {pre_model_memory:.2f}->{post_model_memory:.2f}, "
+                        f"grad {pre_grad_memory:.2f}->{post_grad_memory:.2f}, "
+                        f"optim {pre_optim_memory:.2f}->{post_optim_memory:.2f}, "
+                        f"cuda_alloc {pre_allocated:.2f}->{post_allocated:.2f}"
+                    )
 
                 if log_on_rank0:
                     batch_end_event.record()

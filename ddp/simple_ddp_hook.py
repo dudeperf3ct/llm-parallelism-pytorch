@@ -9,7 +9,7 @@ class SimpleDDPHookGA(SimpleDDPWithGA):
 
     The flow is:
     - `register_backward_hook` registers `self._sync_gradient` on each `Parameter`.
-    - During backward, once a param’s grad is fully accumulated,
+    - During backward, once a param's grad is fully accumulated,
       PyTorch invokes the hook with the parameter.
     - `_sync_gradient` runs on `param.grad`, `all_reduce`s, and divides by `world_size`,
       so `p.grad` ends up averaged across ranks.

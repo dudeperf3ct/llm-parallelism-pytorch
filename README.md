@@ -2,7 +2,8 @@
 
 Implement and compare various data parallelism strategies on Yelp Review Full using `HuggingFaceTB/SmolLM2-360M-Instruct`.
 
-Data Parallelism Write up: https://dudeperf3ct.github.io/posts/implement_data_parallelism/
+* Data Parallelism write up: https://dudeperf3ct.github.io/posts/implement_data_parallelism/
+* Sharding write up: https://dudeperf3ct.github.io/posts/implement_sharding/
 
 ## Requirements
 
@@ -23,9 +24,18 @@ uv sync
 
 To run all implemented strategies in one go:
 
+### DDP
+
 ```bash
-./run_experiment.sh 4
+./run_experiment_ddp.sh 4
 ```
+
+### DDP with Sharding
+
+```bash
+
+```
+
 
 Following sections describe how to run each strategy individually. The `torchrun` CLI sets up the distributed environment variables for you.
 
@@ -33,7 +43,7 @@ Following sections describe how to run each strategy individually. The `torchrun
 # Choose how many GPUs to use on the node
 NUM_GPUS=4
 
-torchrun --standalone --nproc_per_node=$NUM_GPUS main.py --ddp-choice simple_ddp
+torchrun --standalone --nproc_per_node=$NUM_GPUS main_ddp.py --ddp-choice simple_ddp
 ```
 
 Notes:
