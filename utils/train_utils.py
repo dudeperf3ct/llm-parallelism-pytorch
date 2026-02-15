@@ -31,17 +31,21 @@ def set_seed(seed: int = 42) -> None:
 def train_step(batch, model, optimizer):
     """Perform a single training step: forward, backward, optimizer step."""
     optimizer.zero_grad(set_to_none=True)
-    outputs = model(**batch)
+    with torch.profiler.record_function("forward"):
+        outputs = model(**batch)
     loss = outputs.loss
-    loss.backward()
+    with torch.profiler.record_function("backward"):
+        loss.backward()
 
     # If we are using PyTorch's DDP, we don't need to include this step
     # as it uses backward hook to automatically register and bucket gradients
     # Important step for SimpleDDP to sync gradients
     if hasattr(model, "sync_gradients"):
-        model.sync_gradients()
+        with torch.profiler.record_function("grad_sync"):
+            model.sync_gradients()
 
-    optimizer.step()
+    with torch.profiler.record_function("optimizer_step"):
+        optimizer.step()
     return model, optimizer, loss
 
 

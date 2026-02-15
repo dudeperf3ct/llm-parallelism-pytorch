@@ -4,9 +4,7 @@ import torch
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
 )
-from torch.distributed.fsdp import (
-    ShardingStrategy,
-)
+from torch.distributed.fsdp import ShardingStrategy, fully_shard
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -14,6 +12,7 @@ from data import prepare_data
 from ddp.simple_ddp import SimpleDDP
 from ddp_sharding.zero1 import ZeroOneSharding
 from ddp_sharding.zero2 import Zero2Sharding
+from ddp_sharding.zero3 import Zero3Sharding
 from model import get_model
 from utils.ddp_utils import ddp_cleanup, ddp_initialize, get_dist_info
 from utils.train_utils import evaluate, set_seed, train_loop
@@ -27,15 +26,16 @@ parser.add_argument(
     "--shard-choice",
     type=str,
     choices=[
+        "baseline",  # No sharding, just DDP
         "zero1",
         "zero2",
         "zero3",
         "pytorch_zero1",
         "pytorch_zero2",
-        "pytorch_zero3",
-        "pytorch_fsdp2",
+        "pytorch_zero3",  # Also known as FSDP2 in PyTorch
+        # PyTorch FSDP behaves differently to DeepSpeed ZeRO3 sharding
     ],
-    default="zero1",
+    default="baseline",
 )
 
 
@@ -57,10 +57,16 @@ if __name__ == "__main__":
     print(f"Preparing data on rank {global_rank}...")
     train_loader, eval_loader = prepare_data(per_device_batch, local_rank, world_size)
     model = get_model()
-    model.to(device)
+    # For ZeRO3 sharding, the model is already fully sharded and resides on the correct devices,
+    # so we don't need to move it to the device again.
+    if args.shard_choice != "pytorch_zero3":
+        model.to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
-    if args.shard_choice == "zero1":
+    if args.shard_choice == "baseline":
+        model = SimpleDDP(model)
+        grad_accum_steps = None
+    elif args.shard_choice == "zero1":
         model = SimpleDDP(model)
         optim = ZeroOneSharding(optim)
         grad_accum_steps = None
@@ -69,6 +75,13 @@ if __name__ == "__main__":
         optim = Zero2Sharding(optim)
         # Override the default gradient synchronization function in DDP to use
         # the custom one defined in Zero2Sharding
+        model.set_gradient_sync_fn(optim.shard_gradients)
+        grad_accum_steps = None
+    elif args.shard_choice == "zero3":
+        model = SimpleDDP(model)
+        optim = Zero3Sharding(optim)
+        # Override the default pre-forward function in DDP to materialize full parameters before forward
+        model.set_pre_forward_fn(optim.gather_full_parameters)
         model.set_gradient_sync_fn(optim.shard_gradients)
         grad_accum_steps = None
     elif args.shard_choice == "pytorch_zero1":
@@ -81,6 +94,10 @@ if __name__ == "__main__":
         # Using deprecated FSDP API for Zero2 sharding
         sharding_strategy = ShardingStrategy.SHARD_GRAD_OP  # Zero2
         model = FSDP(model, sharding_strategy=sharding_strategy)
+        optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
+        grad_accum_steps = None
+    elif args.shard_choice == "pytorch_zero3":
+        model = fully_shard(model)
         optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
         grad_accum_steps = None
 

@@ -53,7 +53,6 @@ class ZeroOneSharding:
         """Shard optimizer states across ranks.
 
         Each rank keeps only a portion of the optimizer states, determined by the rank and world size.
-        
         """
         total_params = len(self._all_params)
         shard_bounds = self._build_shard_bounds(total=total_params, world_size=self.world_size)
@@ -92,11 +91,12 @@ class ZeroOneSharding:
         self.optimizer.step(closure=closure, **kwargs)
         # After the local optimizer step, synchronize the updated parameters across all ranks
         # This ensures that all ranks have the same parameter values for the next iteration
-        for param in self._all_params:
-            # NOTE: Brodcasting is inefficient for sending and recieving parameters
-            # Broadcast the updated parameter values from the rank that owns them to all other ranks
-            owner_rank = self._param_owner[id(param)]
-            dist.broadcast(tensor=param.data, src=owner_rank)
+        with torch.profiler.record_function("zero1_param_broadcast"):
+            for param in self._all_params:
+                # NOTE: Brodcasting is inefficient for sending and recieving parameters
+                # Broadcast the updated parameter values from the rank that owns them to all other ranks
+                owner_rank = self._param_owner[id(param)]
+                dist.broadcast(tensor=param.data, src=owner_rank)
 
     def zero_grad(self, set_to_none: bool = True):
         # Clear gradients for all model params, not only the local optimizer shard.

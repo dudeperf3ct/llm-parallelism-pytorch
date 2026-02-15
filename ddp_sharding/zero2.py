@@ -93,29 +93,30 @@ class Zero2Sharding:
             Reduce scatter is used to sum the gradients across all ranks and scatter the results
             back to the local shards.
         """
-        for parameter in self._all_params:
-            owner_rank = self._param_owner[id(parameter)]
-            # Not optimal to zero out the gradients on non-owner ranks,
-            # but it keeps the implementation simple as zero tensor instead of None
-            grad = (
-                parameter.grad.detach().contiguous()
-                if parameter.grad is not None
-                else torch.zeros_like(parameter.data)
-            )
-            output = torch.empty_like(grad)
-            input_list = []
-            for rank in range(self.world_size):
-                if rank == owner_rank:
-                    input_list.append(grad)
-                else:
-                    input_list.append(torch.zeros_like(grad))
+        with torch.profiler.record_function("zero2_reduce_scatter"):
+            for parameter in self._all_params:
+                owner_rank = self._param_owner[id(parameter)]
+                # Not optimal to zero out the gradients on non-owner ranks,
+                # but it keeps the implementation simple as zero tensor instead of None
+                grad = (
+                    parameter.grad.detach().contiguous()
+                    if parameter.grad is not None
+                    else torch.zeros_like(parameter.data)
+                )
+                output = torch.empty_like(grad)
+                input_list = []
+                for rank in range(self.world_size):
+                    if rank == owner_rank:
+                        input_list.append(grad)
+                    else:
+                        input_list.append(torch.zeros_like(grad))
 
-            dist.reduce_scatter(output, input_list, op=dist.ReduceOp.SUM)
-            if self.rank == owner_rank:
-                output /= self.world_size
-                parameter.grad = output
-            else:
-                parameter.grad = None
+                dist.reduce_scatter(output, input_list, op=dist.ReduceOp.SUM)
+                if self.rank == owner_rank:
+                    output /= self.world_size
+                    parameter.grad = output
+                else:
+                    parameter.grad = None
 
     def step(self, closure: Callable[[], float] | None = None, **kwargs: Any):
         """Perform single optimizer step and sync parameters across all ranks.
@@ -135,11 +136,12 @@ class Zero2Sharding:
         self.optimizer.step(closure=closure, **kwargs)
         # After the local optimizer step, synchronize the updated parameters across all ranks
         # This ensures that all ranks have the same parameter values for the next iteration
-        for param in self._all_params:
-            # NOTE: Brodcasting is inefficient for sending and recieving parameters
-            # Broadcast the updated parameter values from the rank that owns them to all other ranks
-            owner_rank = self._param_owner[id(param)]
-            dist.broadcast(tensor=param.data, src=owner_rank)
+        with torch.profiler.record_function("zero2_param_broadcast"):
+            for param in self._all_params:
+                # NOTE: Brodcasting is inefficient for sending and recieving parameters
+                # Broadcast the updated parameter values from the rank that owns them to all other ranks
+                owner_rank = self._param_owner[id(param)]
+                dist.broadcast(tensor=param.data, src=owner_rank)
 
     def zero_grad(self, set_to_none: bool = True):
         # Clear gradients for all model params, not only the local optimizer shard.
