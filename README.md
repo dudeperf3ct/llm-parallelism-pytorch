@@ -27,15 +27,14 @@ To run all implemented strategies in one go:
 ### DDP
 
 ```bash
-./run_experiment_ddp.sh 4
+./run_experiment_ddp.sh 2
 ```
 
 ### DDP with Sharding
 
 ```bash
-
+./run_experiment_sharding.sh 2
 ```
-
 
 Following sections describe how to run each strategy individually. The `torchrun` CLI sets up the distributed environment variables for you.
 

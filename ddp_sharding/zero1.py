@@ -53,6 +53,7 @@ class ZeroOneSharding:
         """Shard optimizer states across ranks.
 
         Each rank keeps only a portion of the optimizer states, determined by the rank and world size.
+        
         """
         total_params = len(self._all_params)
         shard_bounds = self._build_shard_bounds(total=total_params, world_size=self.world_size)
@@ -76,6 +77,13 @@ class ZeroOneSharding:
     def step(self, closure: Callable[[], float] | None = None, **kwargs: Any):
         """Perform single optimizer step and sync parameters across all ranks.
 
+        Parameter update:
+            For this implementation, we are using brodcast to synchronize
+            the updated parameters across all ranks after the local optimizer step.
+            In reality, all_gather could be used to gather the updated parameters
+            from all ranks as it reduces the collective-call count and improves
+            the bandwith utilization.
+
         Arguments:
             closure (Callable): a closure that re-evaluates the model and
                 returns the loss; optional for most optimizers.
@@ -85,6 +93,7 @@ class ZeroOneSharding:
         # After the local optimizer step, synchronize the updated parameters across all ranks
         # This ensures that all ranks have the same parameter values for the next iteration
         for param in self._all_params:
+            # NOTE: Brodcasting is inefficient for sending and recieving parameters
             # Broadcast the updated parameter values from the rank that owns them to all other ranks
             owner_rank = self._param_owner[id(param)]
             dist.broadcast(tensor=param.data, src=owner_rank)

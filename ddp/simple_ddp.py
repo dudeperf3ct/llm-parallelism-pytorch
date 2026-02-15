@@ -9,8 +9,15 @@ class SimpleDDP(torch.nn.Module):
         super().__init__()
         self.model = model
         self.rank, self.world_size, self.local_rank = get_dist_info()
+        # Options for custom gradient synchronization function,
+        # used in ZeRO2 and ZeRO3 where gradients are sharded across ranks
+        self._gradient_sync_fn = None
         # broadcast parameters from rank 0 to all other ranks
         self.sync_parameters()
+
+    def set_gradient_sync_fn(self, gradient_sync_fn):
+        """Set a custom gradient synchronization function."""
+        self._gradient_sync_fn = gradient_sync_fn
 
     def sync_parameters(self):
         """Broadcast parameters from rank 0 to all other ranks."""
@@ -25,6 +32,13 @@ class SimpleDDP(torch.nn.Module):
 
     def sync_gradients(self):
         """Average gradients across ranks."""
+        # These are used to override the default gradient sync behaviour
+        # For example, in ZeRO2 and Zero3, the gradients are sharded across ranks
+        # and the synchronization is performed using reduce-scatter semantics.
+        if self._gradient_sync_fn is not None:
+            self._gradient_sync_fn()
+            return
+
         # Synchronize gradients across all ranks
         for param in self.model.parameters():
             # distributed comm: All Reduce
