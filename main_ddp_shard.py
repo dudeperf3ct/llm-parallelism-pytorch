@@ -88,7 +88,7 @@ if __name__ == "__main__":
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         grad_accum_steps = None
         optim = ZeroRedundancyOptimizer(
-            model.parameters(), optimizer_class=torch.optim.AdamW, lr=5e-5, overlap_with_ddp=True
+            model.parameters(), optimizer_class=torch.optim.AdamW, lr=5e-5, overlap_with_ddp=False
         )
     elif args.shard_choice == "pytorch_zero2":
         # Using deprecated FSDP API for Zero2 sharding
