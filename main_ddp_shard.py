@@ -87,6 +87,8 @@ if __name__ == "__main__":
     elif args.shard_choice == "pytorch_zero1":
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         grad_accum_steps = None
+        # Ideally we would like to set overlap_with_ddp=True to overlap the communication of sharding
+        # with DDP's all-reduce of gradients.
         optim = ZeroRedundancyOptimizer(
             model.parameters(), optimizer_class=torch.optim.AdamW, lr=5e-5, overlap_with_ddp=False
         )

@@ -11,9 +11,9 @@ Implement and compare various data parallelism strategies on Yelp Review Full us
 - Multiple GPUs
 - uv
 
-DDP: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $2/hour as of December 2025. It costs me ~$2.25 to complete these experiments.
+**DDP**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $2/hour as of December 2025. It costs me ~$2.25 to complete these experiments.
 
-Sharding: I used a 2 x Nvidia L40 (48 GB) instance using the Run Pod platform to run these experiments. It costs around $0.631/hour as of Feburary 2026.
+**Sharding**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.78/hour as of Feburary 2026. It costs me ~$0.95 to complete these experiments.
 
 ## Setup
 
