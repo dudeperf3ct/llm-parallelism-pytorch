@@ -20,8 +20,12 @@ class Zero2Sharding:
     To update only the local gradients, reduce_scatter can be used to sum the gradients across all ranks
     and scatter the results back to the local shards.
 
-    The behaviour for optimizer states is the same as Zero-1 sharding
-    where each GPU only updates its local parameters and their corresponding states.
+    Note:
+        The behaviour for optimizer states is the same as Zero-1 sharding
+        where each GPU only updates its local parameters and their corresponding states.
+
+        This reference implementation uses parameter-level partitioning: whole ``Parameter`` objects
+        are assigned to owners. It does not split individual tensors across ranks.
     """
 
     def __init__(self, optimizer: torch.optim.Optimizer):
@@ -90,8 +94,9 @@ class Zero2Sharding:
             not the same as a true `None` grad semantically: `None` means "unused this
             step", while zero means "used, but gradient value is 0".
 
-            Reduce scatter is used to sum the gradients across all ranks and scatter the results
-            back to the local shards.
+            ``reduce_scatter`` is used to sum gradients and return owner-local shards.
+            Here it is done per parameter with explicit zero placeholders for non-owners,
+            which is simple but less efficient than bucketized implementations.
         """
         with torch.profiler.record_function("zero2_reduce_scatter"):
             for parameter in self._all_params:
@@ -122,11 +127,12 @@ class Zero2Sharding:
         """Perform single optimizer step and sync parameters across all ranks.
 
         Parameter update:
-            For this implementation, we are using brodcast to synchronize
-            the updated parameters across all ranks after the local optimizer step.
-            In reality, all_gather could be used to gather the updated parameters
-            from all ranks as it reduces the collective-call count and improves
-            the bandwith utilization.
+            In this implementation, we use per-parameter ``broadcast`` from each
+            owner rank to synchronize updated parameters after the local optimizer step.
+
+            ZeRO Stage-2 is often described as synchronizing updated parameter partitions
+            with all-gather style communication. With this code's parameter-level ownership
+            and no bucketization, repeated broadcasts are a simpler equivalent.
 
         Arguments:
             closure (Callable): a closure that re-evaluates the model and
@@ -138,7 +144,7 @@ class Zero2Sharding:
         # This ensures that all ranks have the same parameter values for the next iteration
         with torch.profiler.record_function("zero2_param_broadcast"):
             for param in self._all_params:
-                # NOTE: Brodcasting is inefficient for sending and recieving parameters
+                # Broadcasting each parameter separately is simple but not communication-optimal.
                 # Broadcast the updated parameter values from the rank that owns them to all other ranks
                 owner_rank = self._param_owner[id(param)]
                 dist.broadcast(tensor=param.data, src=owner_rank)

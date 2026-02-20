@@ -5,15 +5,18 @@ Implement and compare various data parallelism strategies on Yelp Review Full us
 * Data Parallelism write up: https://dudeperf3ct.github.io/posts/implement_data_parallelism/
 * Sharding write up: https://dudeperf3ct.github.io/posts/implement_sharding/
 
+## Costs
+
+**DDP**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.79/hour as of December 2025. It costs about $2.25 to complete these experiments.
+
+**Sharding**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.78/hour as of Feburary 2026. It costs about $2 to complete these experiments.
+
+
 ## Requirements
 
 - Python 3.12 (managed via [uv](https://docs.astral.sh/uv/))
 - Multiple GPUs
 - uv
-
-**DDP**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $2/hour as of December 2025. It costs me ~$2.25 to complete these experiments.
-
-**Sharding**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.78/hour as of Feburary 2026. It costs me ~$0.95 to complete these experiments.
 
 ## Setup
 
@@ -55,16 +58,29 @@ Notes:
 
 ## Trace Analysis
 
-Analyze PyTorch profiler traces with [Holistic Trace Analysis](https://github.com/facebookresearch/HolisticTraceAnalysis) (HTA) library. The script generates a single HTML dashboard and a compact CSV summary.
+Analyze PyTorch profiler traces with [Holistic Trace Analysis](https://github.com/facebookresearch/HolisticTraceAnalysis) (HTA).
+
+### DDP traces
 
 ```bash
-python scripts/analyze_traces.py --trace-dir profile/simple_ddp --select latest
+python scripts/analyze_traces_ddp.py --trace-dir profile/simple_ddp --select latest
 ```
 
-By default, the output directory is inferred by replacing `profile/` with `reports/`, so the example above writes to `reports/simple_ddp/summary.html` and `reports/simple_ddp/summary.csv`.
+Output is inferred by replacing `profile/` with `reports/`, so the example above writes:
+- `reports/simple_ddp/summary.html`
+- `reports/simple_ddp/summary.csv`
 
-Optional flags:
-- `--select all` to analyze each trace window and save under `reports/<name>/run_<idx>_<ts>/`.
+### Sharding traces
+```bash
+python scripts/analyze_traces_sharding.py --trace-dir profile_runpod/pytorch_zero3 --select latest
+```
+
+Output is inferred by replacing `profile/` with `reports_sharding/` when applicable. For the above command:
+- `reports_sharding/pytorch_zero3/summary.html`
+- `reports_sharding/pytorch_zero3/summary.csv`
+
+Optional flags for both scripts:
+- `--select all` to analyze each trace window and save under `run_<idx>_<ts>/`.
 - `--enable-multiprocessing` to parse traces with multiprocessing.
 
 >[!NOTE]

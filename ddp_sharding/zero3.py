@@ -14,17 +14,20 @@ class Zero3Sharding:
 
     In Zero-3 sharding, parameters, gradients, and optimizer states are sharded
     across available GPUs.
-    - Parameters are sharded(non-owner ranks keep empty tensors). Limitation here is
-    that whole parameters are sharded by index across ranks, which may not be optimal.
-    In practice, tensor level sharding (split each large tensors into equal size across ranks) can be
-    used to shard large parameters across ranks.
+    - Parameters are sharded by ownership (non-owner ranks keep empty tensors).
+      This is parameter-level partitioning: whole ``Parameter`` objects are assigned by index.
+      It does not split each parameter tensor across ranks.
     - Full parameters are materialized before forward via owner broadcast.
     - Gradients are sharded using reduce-scatter similar to Zero2.
     - Full parameters are resharded after backward to free memory.
     - Optimizer step updates only local-owner parameters/states similar to Zero1 and Zero2.
 
-    The behaviour for optimizer states is the same as Zero-1 and Zero-2 sharding
-    where each GPU only updates its local parameters and their corresponding states.
+    Note:
+        The behaviour for optimizer states is the same as Zero-1 and Zero-2 sharding
+        where each GPU only updates its local parameters and their corresponding states.
+
+        Native PyTorch FSDP/FSDP2 uses tensor-level (intra-parameter) sharding semantics,
+        while this class is intentionally a simpler parameter-ownership reference.
     """
 
     def __init__(self, optimizer: torch.optim.Optimizer):
@@ -97,8 +100,10 @@ class Zero3Sharding:
             We broadcast the full parameters from their owner ranks to all other ranks before forward pass,
             so that the full model is materialized on each rank for the forward and backward computations.
 
-        Note: Broadcast is used here for simplicity, but in practice, all_gather could be used to gather the parameters
-        from all ranks as it reduces the collective-call count and improves the bandwith utilization.
+        Note:
+            For this parameter-ownership layout, ``broadcast`` is the natural primitive because each
+            full parameter lives on one owner rank. If each rank held tensor slices of every parameter
+            (tensor-level partitioning), ``all_gather`` of slices would be the natural primitive.
         """
         with torch.profiler.record_function("zero3_param_gather"):
             for parameter in self._all_params:

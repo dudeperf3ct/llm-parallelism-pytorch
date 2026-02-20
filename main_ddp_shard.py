@@ -1,10 +1,7 @@
 import argparse
 
 import torch
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-)
-from torch.distributed.fsdp import ShardingStrategy, fully_shard
+from torch.distributed.fsdp import fully_shard
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -32,14 +29,23 @@ parser.add_argument(
         "zero3",
         "pytorch_zero1",
         "pytorch_zero2",
-        "pytorch_zero3",  # Also known as FSDP2 in PyTorch
-        # PyTorch FSDP behaves differently to DeepSpeed ZeRO3 sharding
+        "pytorch_zero3",  # Implemented as FSDP2 in PyTorch different from DeepSpeed ZeRO3
+        # Native PyTorch FSDP2 uses tensor-level sharding semantics.
+        # This repo's custom zero3 path is a simpler parameter-level ownership implementation.
     ],
     default="baseline",
 )
 
 
 args = parser.parse_args()
+
+
+def wrap_with_fsdp2(model, reshard_after_forward: bool):
+    """Apply FSDP2 fully_shard per decoder block, then on the full module."""
+    for layer in model.model.layers:  # decoder blocks
+        fully_shard(layer, reshard_after_forward=reshard_after_forward)
+    return fully_shard(model, reshard_after_forward=reshard_after_forward)
+
 
 if __name__ == "__main__":
     set_seed(SEED)
@@ -57,9 +63,8 @@ if __name__ == "__main__":
     print(f"Preparing data on rank {global_rank}...")
     train_loader, eval_loader = prepare_data(per_device_batch, local_rank, world_size)
     model = get_model()
-    # For ZeRO3 sharding, the model is already fully sharded and resides on the correct devices,
-    # so we don't need to move it to the device again.
-    if args.shard_choice != "pytorch_zero3":
+    # For PyTorch ZeRO2/ZeRO3 we use FSDP2 fully_shard, so skip eager device placement.
+    if args.shard_choice not in {"pytorch_zero2", "pytorch_zero3"}:
         model.to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
@@ -93,13 +98,13 @@ if __name__ == "__main__":
             model.parameters(), optimizer_class=torch.optim.AdamW, lr=5e-5, overlap_with_ddp=False
         )
     elif args.shard_choice == "pytorch_zero2":
-        # Using deprecated FSDP API for Zero2 sharding
-        sharding_strategy = ShardingStrategy.SHARD_GRAD_OP  # Zero2
-        model = FSDP(model, sharding_strategy=sharding_strategy)
+        # FSDP2 ZeRO2-like mode: keep full params after forward to reduce all-gather frequency.
+        model = wrap_with_fsdp2(model, reshard_after_forward=False)
         optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
         grad_accum_steps = None
     elif args.shard_choice == "pytorch_zero3":
-        model = fully_shard(model)
+        # FSDP2 ZeRO3-like mode: reshard after forward for maximum memory savings.
+        model = wrap_with_fsdp2(model, reshard_after_forward=True)
         optim = torch.optim.AdamW(model.parameters(), lr=5e-5)
         grad_accum_steps = None
 
@@ -115,8 +120,7 @@ if __name__ == "__main__":
         grad_accum_steps=grad_accum_steps,
         is_async=False,
         is_hook=False,
-        log_memory_before_after=True,
-        memory_log_interval=max(1, len(train_loader) // 10),  # log memory every 10 batches
+        memory_log_interval=1,  # log memory every batch
     )
     evaluate(model, eval_loader, device=device)
 
