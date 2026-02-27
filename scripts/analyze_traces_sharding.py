@@ -265,6 +265,11 @@ def write_dashboard(summary: pd.DataFrame, out_path: Path) -> None:
     fig.update_yaxes(title_text="%", range=[0, 100], row=2, col=2)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(out_path)
+    # fig.write_html(
+    #     out_path,
+    #     include_plotlyjs="cdn",
+    #     full_html=False,
+    # )
 
 
 def print_summary(summary: pd.DataFrame, out_dir: Path) -> None:
