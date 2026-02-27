@@ -6,7 +6,10 @@ import torch
 import torch.distributed as dist
 
 from .ddp_utils import get_dist_info
-from .memory_utils import print_memory_stats
+from .memory_utils import (
+    print_memory_snapshot,
+    reset_cuda_peak_memory,
+)
 from .pt_profiler import pt_profiler
 
 
@@ -26,17 +29,21 @@ def set_seed(seed: int = 42) -> None:
 def train_step(batch, model, optimizer):
     """Perform a single training step: forward, backward, optimizer step."""
     optimizer.zero_grad(set_to_none=True)
-    outputs = model(**batch)
+    with torch.profiler.record_function("forward"):
+        outputs = model(**batch)
     loss = outputs.loss
-    loss.backward()
+    with torch.profiler.record_function("backward"):
+        loss.backward()
 
     # If we are using PyTorch's DDP, we don't need to include this step
     # as it uses backward hook to automatically register and bucket gradients
     # Important step for SimpleDDP to sync gradients
     if hasattr(model, "sync_gradients"):
-        model.sync_gradients()
+        with torch.profiler.record_function("grad_sync"):
+            model.sync_gradients()
 
-    optimizer.step()
+    with torch.profiler.record_function("optimizer_step"):
+        optimizer.step()
     return model, optimizer, loss
 
 
@@ -91,6 +98,7 @@ def train_loop(  # noqa
     grad_accum_steps=None,
     is_async=False,
     is_hook=False,
+    memory_log_interval=0,
 ):
     """Train a model while logging timing stats for each batch and epoch.
 
@@ -104,6 +112,7 @@ def train_loop(  # noqa
         grad_accum_steps: Number of steps for gradient accumulation (optional).
         is_async: Whether to use asynchronous gradient synchronization (optional).
         is_hook: Whether to use hook-based gradient synchronization (optional).
+        memory_log_interval: Log memory every N batches on all ranks (0 disables per-batch logs).
     """
     rank, _, _ = get_dist_info()
     log_on_rank0 = rank == 0
@@ -125,6 +134,7 @@ def train_loop(  # noqa
     with profiler_cm as profiler:
         for epoch in range(epochs):
             data.sampler.set_epoch(epoch)
+            reset_cuda_peak_memory(device)
             epoch_start = time.perf_counter()
             epoch_move_times = []
             epoch_batch_times = []
@@ -134,6 +144,7 @@ def train_loop(  # noqa
                 last_batch_idx = batch_idx
                 move_time = 0.0
                 batch_time = 0.0
+                log_step_memory = memory_log_interval > 0 and batch_idx % memory_log_interval == 0
 
                 if log_on_rank0:
                     batch_start_event.record()
@@ -156,6 +167,16 @@ def train_loop(  # noqa
                     )
                 else:
                     model, optimizer, loss = train_step(batch, model, optimizer)
+
+                if log_step_memory:
+                    print_memory_snapshot(
+                        prefix=f"Epoch {epoch + 1} Batch {batch_idx}",
+                        model=model,
+                        optimizer=optimizer,
+                        rank=rank,
+                        device=device,
+                        sync_cuda=True,
+                    )
 
                 if log_on_rank0:
                     batch_end_event.record()
@@ -209,12 +230,13 @@ def train_loop(  # noqa
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            print_memory_stats(
+            print_memory_snapshot(
                 prefix=f"Epoch {epoch + 1} end",
                 model=model,
                 optimizer=optimizer,
                 rank=rank,
                 device=device,
+                sync_cuda=True,
             )
 
     total_time = time.perf_counter() - total_start
