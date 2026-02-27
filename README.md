@@ -56,10 +56,12 @@ Notes:
 - Logs print only on rank 0
 - You can change `--ddp-choice` to try different strategies: `simple_ddp`, `simple_ddp_ga`, `simple_ddp_hook`, `simple_ddp_async`, `bucket_ddp_async`, `pytorch_ddp`.
 
-<details>
-<summary><strong>NCCL Hang (diagnosis + fix)</strong></summary>
+## NCCL Debugging
 
 Sometimes the training gets stuck on first epoch due to an NCCL hang. The fix involved disabling P2P but can also be optimized based on the topology. 
+
+<details>
+<summary><strong>NCCL Hang (diagnosis + fix)</strong></summary>
 
 During training with 2x NVIDIA L4 GPUs, the run would freeze on the first epoch with both GPUs pegged at 100% utilization but no progress. No error was thrown — the process just hung indefinitely. This is a classic NCCL collective communication hang.
 

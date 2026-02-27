@@ -202,7 +202,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Profile directory
-profile
+profile*
 
 # Trace analysis reports
-reports
+reports*
