@@ -82,8 +82,9 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS main_pp.py --pp-choice naive_pp
 Notes:
 - In PP mode, each stage consumes the same samples (model parallel), so data is not sharded by rank.
 - PP uses `distilbert/distilbert-base-uncased` instead of the default SmolLM2 model.
-- The reason is PyTorch's `torch.distributed.pipelining.pipeline(...)` frontend depends on full `torch.export` graph capture, and the current SmolLM2/Llama path hits export graph-break issues on this stack.
-- DistilBERT traces cleanly with the PyTorch pipeline frontend, so both scratch PP and PyTorch PP can run on the same model and be compared fairly.
+- The reason is PyTorch's automatic `torch.distributed.pipelining.pipeline(...)` frontend depends on full `torch.export` graph capture, and the current SmolLM2/Llama path hits export graph-break issues on this stack.
+- Even with DistilBERT, the automatic splitter failed here during backward setup with `AssertionError: Backward of skip connections not supported yet`.
+- Because of that, the PyTorch PP path uses manual `PipelineStage` construction instead of automatic splitting. This follows the PyTorch docs recommendation to manually split models when the automatic frontend cannot produce a clean sequential pipeline: https://docs.pytorch.org/docs/main/distributed.pipelining.html#option-1-splitting-a-model-manually
 - Scratch PP modes (`naive_pp`, `gpipe_pp`, `1f1b_pp`) use fixed-shape stage buffers.
 - PyTorch PP modes (`pytorch_gpipe_pp`, `pytorch_1f1b_pp`) use `torch.distributed.pipelining` schedules.
 - Profiler traces land under `profile/<pp_choice>/rank_<rank>/`.

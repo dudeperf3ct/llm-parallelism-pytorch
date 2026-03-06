@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-from torch.distributed.pipelining import Schedule1F1B, ScheduleGPipe, SplitPoint, pipeline
+from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleGPipe
 from transformers.models.distilbert.modeling_distilbert import _prepare_4d_attention_mask_for_sdpa
 
 from data import prepare_data
@@ -63,8 +63,14 @@ def stage_bounds(n_layers: int, num_stages: int, rank: int) -> tuple[int, int]:
     return start, end
 
 
-def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
-    """Build rank-local module shard for scratch PP."""
+def build_stage_module(
+    model: torch.nn.Module,
+    num_stages: int,
+    rank: int,
+    *,
+    propagate_attention_mask: bool,
+):
+    """Build one DistilBERT stage module for either scratch or PyTorch PP."""
     layers = get_pp_layers(model)
     n_layers = len(layers)
     start, end = stage_bounds(n_layers, num_stages, rank)
@@ -76,6 +82,7 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
             super().__init__()
             self.embeddings = model.distilbert.embeddings if is_first else None
             self.layers = nn.ModuleList(layers[start:end])
+            self.propagate_attention_mask = propagate_attention_mask and not is_last
             self.pre_classifier = getattr(model, "pre_classifier", None) if is_last else None
             self.dropout = getattr(model, "dropout", None) if is_last else None
             self.classifier = getattr(model, "classifier", None) if is_last else None
@@ -94,13 +101,14 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
             # Other stages: x is already hidden states [B, S, H].
             hidden_states = self.embeddings(x) if self.embeddings is not None else x
             if attention_mask is None:
-                attention_mask = torch.ones(
+                attention_mask_2d = torch.ones(
                     hidden_states.shape[:2], device=hidden_states.device, dtype=torch.bool
                 )
             else:
-                attention_mask = attention_mask.to(
+                attention_mask_2d = attention_mask.to(
                     hidden_states.device, dtype=torch.bool, non_blocking=True
                 )
+            attention_mask = attention_mask_2d
             if model.config._attn_implementation == "sdpa":
                 attention_mask = _prepare_4d_attention_mask_for_sdpa(
                     attention_mask,
@@ -121,47 +129,53 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
                 if self.dropout is not None:
                     pooled_output = self.dropout(pooled_output)
                 return self.classifier(pooled_output)
-            # Non-last stages send hidden states [B, S, H] to the next stage.
+            if self.propagate_attention_mask:
+                return hidden_states, attention_mask_2d
+            # Scratch stages send hidden states [B, S, H] only.
             return hidden_states
 
     return ScratchStageModule()
 
 
-def build_uniform_split_spec(model: torch.nn.Module, num_stages: int) -> dict[str, SplitPoint]:
-    """Build split points by evenly partitioning encoder layers across stages."""
-    layers = get_pp_layers(model)
-    n_layers = len(layers)
-    layers_per_stage = max(1, n_layers // num_stages)
-    split_spec: dict[str, SplitPoint] = {}
-    for stage_idx in range(1, num_stages):
-        boundary = stage_idx * layers_per_stage
-        if boundary < n_layers:
-            split_spec[f"distilbert.transformer.layer.{boundary}"] = SplitPoint.BEGINNING
-    return split_spec
+def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
+    """Build rank-local module shard for scratch PP."""
+    return build_stage_module(
+        model,
+        num_stages,
+        rank,
+        propagate_attention_mask=False,
+    )
 
 
-def wrap_pytorch_pipeline(
+def build_pytorch_stage(
     model: torch.nn.Module,
-    example_input_ids: torch.Tensor,
-    example_attention_mask: torch.Tensor,
     rank: int,
     device: torch.device,
     pp_group,
 ):
-    """Wrap the model to split it across ranks.
+    """Build a manual PipelineStage for PyTorch PP.
 
-    Here build_uniform_split_spec is used to split the model into equal parts
-    across the pipeline stages.
+    The automatic `pipeline(...)` frontend traces the full graph and then infers
+    stage boundaries. On this DistilBERT classifier path it fails during
+    backward setup with `Backward of skip connections not supported yet`.
+    Manual stage construction keeps the cross-stage graph linear by explicitly
+    returning `(hidden_states, attention_mask)` between stages.
     """
-    # The split spec defines where to split the model for pipeline parallelism.
-    split_spec = build_uniform_split_spec(model, dist.get_world_size(pp_group))
-    pipe = pipeline(
-        module=model,
-        mb_args=(example_input_ids,),
-        mb_kwargs={"attention_mask": example_attention_mask},
-        split_spec=split_spec,
+    stage_module = build_stage_module(
+        model,
+        dist.get_world_size(pp_group),
+        rank,
+        propagate_attention_mask=True,
     )
-    return pipe.build_stage(rank, device, pp_group)
+    stage_module = stage_module.to(device)
+    stage = PipelineStage(
+        stage_module,
+        rank,
+        dist.get_world_size(pp_group),
+        device,
+        group=pp_group,
+    )
+    return stage
 
 
 def pp_loss_fn(outputs, labels, attention_mask=None):
@@ -237,9 +251,7 @@ if __name__ == "__main__":
     model = get_pp_model()
 
     if args.pp_choice == "pytorch_gpipe_pp":
-        stage = wrap_pytorch_pipeline(
-            model, example_input_ids, example_attention_mask, pp_rank, device, pp_group
-        )
+        stage = build_pytorch_stage(model, pp_rank, device, pp_group)
         schedule = ScheduleGPipe(stage, n_microbatches=NUM_MICROBATCHES, loss_fn=pp_loss_fn)
         optimizer = torch.optim.AdamW(stage.submod.parameters(), lr=5e-5)
         engine = PytorchPPEngine(
@@ -250,9 +262,7 @@ if __name__ == "__main__":
             pp_group=pp_group,
         )
     elif args.pp_choice == "pytorch_1f1b_pp":
-        stage = wrap_pytorch_pipeline(
-            model, example_input_ids, example_attention_mask, pp_rank, device, pp_group
-        )
+        stage = build_pytorch_stage(model, pp_rank, device, pp_group)
         schedule = Schedule1F1B(stage, n_microbatches=NUM_MICROBATCHES, loss_fn=pp_loss_fn)
         optimizer = torch.optim.AdamW(stage.submod.parameters(), lr=5e-5)
         engine = PytorchPPEngine(
