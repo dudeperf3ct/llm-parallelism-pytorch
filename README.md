@@ -1,6 +1,10 @@
 # Distributed Training Experiments
 
-Implement and compare various data parallelism strategies on Yelp Review Full using `HuggingFaceTB/SmolLM2-360M-Instruct`.
+Implement and compare various distributed training strategies on Yelp Review Full.
+
+Model choice by experiment:
+- DDP and sharding use `HuggingFaceTB/SmolLM2-360M-Instruct`.
+- Pipeline parallelism uses `distilbert/distilbert-base-uncased`.
 
 * Data Parallelism write up: https://dudeperf3ct.github.io/posts/implement_data_parallelism/
 * Sharding write up: https://dudeperf3ct.github.io/posts/implement_sharding/
@@ -77,6 +81,9 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS main_pp.py --pp-choice naive_pp
 
 Notes:
 - In PP mode, each stage consumes the same samples (model parallel), so data is not sharded by rank.
+- PP uses `distilbert/distilbert-base-uncased` instead of the default SmolLM2 model.
+- The reason is PyTorch's `torch.distributed.pipelining.pipeline(...)` frontend depends on full `torch.export` graph capture, and the current SmolLM2/Llama path hits export graph-break issues on this stack.
+- DistilBERT traces cleanly with the PyTorch pipeline frontend, so both scratch PP and PyTorch PP can run on the same model and be compared fairly.
 - Scratch PP modes (`naive_pp`, `gpipe_pp`, `1f1b_pp`) use fixed-shape stage buffers.
 - PyTorch PP modes (`pytorch_gpipe_pp`, `pytorch_1f1b_pp`) use `torch.distributed.pipelining` schedules.
 - Profiler traces land under `profile/<pp_choice>/rank_<rank>/`.

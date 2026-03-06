@@ -8,15 +8,15 @@ from model import get_tokenizer
 
 DATASET_NAME = "Yelp/yelp_review_full"
 
-tokenizer = get_tokenizer()
 TOKENIZE_BATCH_SIZE = 1000
 DEFAULT_NUM_PROC = max(1, os.cpu_count())
 
 
-def get_data_collator(static_shapes: bool = False, fixed_seq_len: int | None = None):
+def get_data_collator(tokenizer, static_shapes: bool = False, fixed_seq_len: int | None = None):
     """Build a collator for either dynamic or fixed-shape batching.
 
     Args:
+        tokenizer: Tokenizer used for padding.
         static_shapes: If True, enforce a fixed sequence length per batch.
         fixed_seq_len: Target sequence length when `static_shapes=True`.
     """
@@ -37,7 +37,7 @@ def get_dataset():
     return load_dataset(DATASET_NAME)
 
 
-def tokenize_function(examples, max_length: int | None = None):
+def tokenize_function(examples, tokenizer, max_length: int | None = None):
     return tokenizer(
         examples["text"],
         padding=False,
@@ -46,11 +46,12 @@ def tokenize_function(examples, max_length: int | None = None):
     )
 
 
-def tokenize_data(dataset, max_length: int | None = None):
+def tokenize_data(dataset, tokenizer, max_length: int | None = None):
     """Tokenize the raw dataset.
 
     Args:
         dataset: The raw dataset to prepare.
+        tokenizer: Tokenizer used for preprocessing.
         max_length: Optional truncation length.
 
     Returns:
@@ -61,7 +62,7 @@ def tokenize_data(dataset, max_length: int | None = None):
         batched=True,
         batch_size=TOKENIZE_BATCH_SIZE,
         num_proc=DEFAULT_NUM_PROC,
-        fn_kwargs={"max_length": max_length},
+        fn_kwargs={"tokenizer": tokenizer, "max_length": max_length},
     )
 
 
@@ -91,6 +92,7 @@ def prepare_data(
     static_shapes: bool = False,
     fixed_seq_len: int | None = None,
     drop_last_train: bool = False,
+    tokenizer=None,
 ):
     """Prepare the dataset for training and evaluation.
 
@@ -102,16 +104,18 @@ def prepare_data(
         static_shapes: Whether to enforce fixed sequence length in collator.
         fixed_seq_len: Sequence length for static-shape mode.
         drop_last_train: Whether to drop the last incomplete train batch.
+        tokenizer: Optional tokenizer override for the target model.
 
     Returns:
         train_loader: DataLoader for training dataset.
         eval_loader: DataLoader for evaluation dataset.
     """
+    tokenizer = tokenizer if tokenizer is not None else get_tokenizer()
     raw_dataset = get_dataset()
     raw_dataset["train"] = raw_dataset["train"].shuffle(seed=42).select(range(32))
     raw_dataset["test"] = raw_dataset["test"].shuffle(seed=42).select(range(16))
     tokenize_max_length = fixed_seq_len if static_shapes else None
-    tokenized_dataset = tokenize_data(raw_dataset, max_length=tokenize_max_length)
+    tokenized_dataset = tokenize_data(raw_dataset, tokenizer, max_length=tokenize_max_length)
     train_ds, eval_ds = split_dataset(tokenized_dataset)
 
     if rank == 0:
@@ -119,7 +123,11 @@ def prepare_data(
             f"Dataset sizes -> train: {len(train_ds)} samples, "
             f"eval: {len(eval_ds)} samples (world size={world_size})"
         )
-    collator = get_data_collator(static_shapes=static_shapes, fixed_seq_len=fixed_seq_len)
+    collator = get_data_collator(
+        tokenizer,
+        static_shapes=static_shapes,
+        fixed_seq_len=fixed_seq_len,
+    )
     num_workers = min(8, os.cpu_count() // max(1, world_size))
     use_workers = num_workers > 0
     if shard_data:

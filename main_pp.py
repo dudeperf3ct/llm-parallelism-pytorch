@@ -1,24 +1,20 @@
 import argparse
-from importlib import import_module
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.pipelining import Schedule1F1B, ScheduleGPipe, SplitPoint, pipeline
-from transformers.models.llama.modeling_llama import create_causal_mask
 
 from data import prepare_data
-from model import get_model
+from model import get_pp_model, get_pp_tokenizer
 from pp.gpipe_pp import GPipePipeline
 from pp.naive_pp import NaivePipeline
+from pp.onef1b_pp import OneFOneBPipeline
 from pp.pytorch_engine import PytorchPPEngine
 from pp.scratch_engine import ScratchPPEngine
 from utils.ddp_utils import ddp_cleanup, ddp_initialize, get_dist_info
 from utils.train_utils import set_seed, train_loop_pp
-
-# Module name starts with a digit, so load via importlib.
-OneFOneBPipeline = import_module("pp.1f1b_pp").OneFOneBPipeline
 
 GLOBAL_BATCH_SIZE = 32
 NUM_MICROBATCHES = 4
@@ -45,6 +41,18 @@ parser.add_argument(
 args = parser.parse_args()
 
 
+def get_pp_layers(model: torch.nn.Module) -> nn.ModuleList:
+    """Return the encoder layers used for PP splitting."""
+    if not hasattr(model, "distilbert") or not hasattr(model.distilbert, "transformer"):
+        raise ValueError("Expected DistilBERT backbone for pipeline parallelism.")
+    return model.distilbert.transformer.layer
+
+
+def get_pp_hidden_size(model: torch.nn.Module) -> int:
+    """Return the hidden width of the PP model."""
+    return getattr(model.config, "dim", model.config.hidden_size)
+
+
 def stage_bounds(n_layers: int, num_stages: int, rank: int) -> tuple[int, int]:
     # even split with remainder on early ranks
     base = n_layers // num_stages
@@ -56,11 +64,8 @@ def stage_bounds(n_layers: int, num_stages: int, rank: int) -> tuple[int, int]:
 
 def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
     """Build rank-local module shard for scratch PP."""
-
-    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
-        raise ValueError("Expected model.model.layers for splitting the model.")
-
-    n_layers = len(model.model.layers)
+    layers = get_pp_layers(model)
+    n_layers = len(layers)
     start, end = stage_bounds(n_layers, num_stages, rank)
     is_first = rank == 0
     is_last = rank == num_stages - 1
@@ -68,11 +73,11 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
     class ScratchStageModule(nn.Module):
         def __init__(self):
             super().__init__()
-            self.embed_tokens = model.model.embed_tokens if is_first else None
-            self.layers = nn.ModuleList(model.model.layers[start:end])
-            self.norm = getattr(model.model, "norm", None) if is_last else None
+            self.embeddings = model.distilbert.embeddings if is_first else None
+            self.layers = nn.ModuleList(layers[start:end])
+            self.pre_classifier = getattr(model, "pre_classifier", None) if is_last else None
             self.dropout = getattr(model, "dropout", None) if is_last else None
-            self.classifier = getattr(model, "score", None) if is_last else None
+            self.classifier = getattr(model, "classifier", None) if is_last else None
 
         def forward(self, x, attention_mask=None):
             """Run this stage shard.
@@ -86,7 +91,7 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
             """
             # Stage 0: token ids [B, S] -> embeddings [B, S, H].
             # Other stages: x is already hidden states [B, S, H].
-            hidden_states = self.embed_tokens(x) if self.embed_tokens is not None else x
+            hidden_states = self.embeddings(x) if self.embeddings is not None else x
             if attention_mask is None:
                 attention_mask = torch.ones(
                     hidden_states.shape[:2], device=hidden_states.device, dtype=torch.long
@@ -94,41 +99,19 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
             else:
                 attention_mask = attention_mask.to(hidden_states.device, non_blocking=True)
 
-            # Llama decoder blocks expect causal mask + RoPE position embeddings
-            # prepared at model scope; rebuild them for this stage-local path.
-            seq_len = hidden_states.shape[1]
-            cache_position = torch.arange(seq_len, device=hidden_states.device)
-            position_ids = cache_position.unsqueeze(0)
-            causal_mask = create_causal_mask(
-                config=model.model.config,
-                input_embeds=hidden_states,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=None,
-                position_ids=position_ids,
-            )
-            position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
-
             for layer in self.layers:
                 # Decoder block preserves hidden shape: [B, S, H] -> [B, S, H].
-                out = layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_values=None,
-                    use_cache=False,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
+                out = layer(hidden_states, attn_mask=attention_mask)
                 hidden_states = out[0] if isinstance(out, tuple) else out
 
-            if self.norm is not None:
-                hidden_states = self.norm(hidden_states)
-            if self.dropout is not None:
-                hidden_states = self.dropout(hidden_states)
             if self.classifier is not None:
-                # Current head path produces token-level logits [B, S, C].
-                return self.classifier(hidden_states)
+                pooled_output = hidden_states[:, 0]
+                if self.pre_classifier is not None:
+                    pooled_output = self.pre_classifier(pooled_output)
+                    pooled_output = F.relu(pooled_output)
+                if self.dropout is not None:
+                    pooled_output = self.dropout(pooled_output)
+                return self.classifier(pooled_output)
             # Non-last stages send hidden states [B, S, H] to the next stage.
             return hidden_states
 
@@ -136,17 +119,15 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
 
 
 def build_uniform_split_spec(model: torch.nn.Module, num_stages: int) -> dict[str, SplitPoint]:
-    """Build split points by evenly partitioning decoder layers across stages."""
-    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
-        raise ValueError("Expected model.model.layers for building split points.")
-
-    n_layers = len(model.model.layers)
+    """Build split points by evenly partitioning encoder layers across stages."""
+    layers = get_pp_layers(model)
+    n_layers = len(layers)
     layers_per_stage = max(1, n_layers // num_stages)
     split_spec: dict[str, SplitPoint] = {}
     for stage_idx in range(1, num_stages):
         boundary = stage_idx * layers_per_stage
         if boundary < n_layers:
-            split_spec[f"model.layers.{boundary}"] = SplitPoint.BEGINNING
+            split_spec[f"distilbert.transformer.layer.{boundary}"] = SplitPoint.BEGINNING
     return split_spec
 
 
@@ -183,7 +164,7 @@ def pp_loss_fn(outputs, labels, attention_mask=None):
     else:
         logits = outputs
 
-    # Scratch split can produce token-level logits [B, S, C].
+    # Scratch split for decoder-style models can produce token-level logits [B, S, C].
     # Convert to sequence logits [B, C] using the last non-pad token when mask is available.
     if logits.ndim == 3:
         if attention_mask is not None:
@@ -208,6 +189,7 @@ if __name__ == "__main__":
     pp_world_size = dist.get_world_size(pp_group)
     per_stage_batch = GLOBAL_BATCH_SIZE
     use_static_shapes = args.pp_choice in {"naive_pp", "gpipe_pp", "1f1b_pp"}
+    pp_tokenizer = get_pp_tokenizer()
     print(f"Rank: {global_rank}, World Size: {world_size}, Local Rank: {local_rank}")
     device = torch.device(f"cuda:{local_rank}")
     num_stages = pp_world_size
@@ -228,6 +210,7 @@ if __name__ == "__main__":
         per_stage_batch,
         global_rank,
         world_size,
+        tokenizer=pp_tokenizer,
         shard_data=False,
         static_shapes=use_static_shapes,
         fixed_seq_len=SCRATCH_FIXED_SEQ_LEN if use_static_shapes else None,
@@ -242,7 +225,7 @@ if __name__ == "__main__":
     example_input_ids = sample_batch["input_ids"][:microbatch_size].clone()
     example_attention_mask = sample_batch["attention_mask"][:microbatch_size].clone()
 
-    model = get_model()
+    model = get_pp_model()
 
     if args.pp_choice == "pytorch_gpipe_pp":
         stage = wrap_pytorch_pipeline(
@@ -277,7 +260,7 @@ if __name__ == "__main__":
         # For the naive pipeline, num_microbatches = 1
         micro_batch_size = per_stage_batch // 1
         seq_len = example_input_ids.shape[1]
-        hidden = model.config.hidden_size  # for transformer hidden activations
+        hidden = get_pp_hidden_size(model)
 
         # We are fixing activation shape for scratch comm buffers.
         # This assumes fixed seq_len across steps; dynamic padding can violate it.
@@ -305,7 +288,7 @@ if __name__ == "__main__":
         optimizer = torch.optim.AdamW(stage_module.parameters(), lr=5e-5)
 
         seq_len = example_input_ids.shape[1]
-        hidden = model.config.hidden_size  # for transformer hidden activations
+        hidden = get_pp_hidden_size(model)
 
         # We are fixing activation shape for scratch comm buffers.
         # This assumes fixed seq_len across steps; dynamic padding can violate it.
@@ -333,7 +316,7 @@ if __name__ == "__main__":
         optimizer = torch.optim.AdamW(stage_module.parameters(), lr=5e-5)
 
         seq_len = example_input_ids.shape[1]
-        hidden = model.config.hidden_size
+        hidden = get_pp_hidden_size(model)
         micro_batch_size = per_stage_batch // NUM_MICROBATCHES
         activation_shape = (micro_batch_size, seq_len, hidden)
         in_shape = None if pp_rank == 0 else activation_shape
