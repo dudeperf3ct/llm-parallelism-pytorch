@@ -130,7 +130,10 @@ def build_stage_module(
                     pooled_output = self.dropout(pooled_output)
                 return self.classifier(pooled_output)
             if self.propagate_attention_mask:
-                return hidden_states, attention_mask_2d
+                # PipelineStage marks received tensors as requiring grad, which is only
+                # valid for floating tensors. Send the mask as float and cast back to
+                # bool on the next stage.
+                return hidden_states, attention_mask_2d.to(hidden_states.dtype)
             # Scratch stages send hidden states [B, S, H] only.
             return hidden_states
 
