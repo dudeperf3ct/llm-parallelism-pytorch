@@ -4,6 +4,7 @@ Implement and compare various data parallelism strategies on Yelp Review Full us
 
 * Data Parallelism write up: https://dudeperf3ct.github.io/posts/implement_data_parallelism/
 * Sharding write up: https://dudeperf3ct.github.io/posts/implement_sharding/
+* Pipeline Parallelism write up: 
 
 ## Costs
 
@@ -41,6 +42,12 @@ To run all implemented strategies in one go:
 ./run_experiment_shard.sh 2
 ```
 
+### Pipeline Parallelism
+
+```bash
+./run_experiment_pp.sh 2
+```
+
 Following sections describe how to run each strategy individually. The `torchrun` CLI sets up the distributed environment variables for you.
 
 ```bash
@@ -55,6 +62,22 @@ Notes:
 - Profiler traces land under `profile/<ddp_choice>/rank_<rank>/`.
 - Logs print only on rank 0
 - You can change `--ddp-choice` to try different strategies: `simple_ddp`, `simple_ddp_ga`, `simple_ddp_hook`, `simple_ddp_async`, `bucket_ddp_async`, `pytorch_ddp`.
+
+## Pipeline Parallelism
+
+Run a specific PP strategy:
+
+```bash
+NUM_GPUS=4
+
+torchrun --standalone --nproc_per_node=$NUM_GPUS main_pp.py --pp-choice naive_pp
+```
+
+Notes:
+- In PP mode, each stage consumes the same samples (model parallel), so data is not sharded by rank.
+- Scratch PP modes (`naive_pp`, `gpipe_pp`, `1f1b_pp`) use fixed-shape stage buffers.
+- PyTorch PP modes (`pytorch_gpipe_pp`, `pytorch_1f1b_pp`) use `torch.distributed.pipelining` schedules.
+- Profiler traces land under `profile/<pp_choice>/rank_<rank>/`.
 
 ## NCCL Debugging
 

@@ -13,6 +13,50 @@ from .memory_utils import (
 from .pt_profiler import pt_profiler
 
 
+def _build_profiler_config(total_steps: int, max_active: int = 10) -> tuple[int, int, int, int]:
+    """Build a practical profiler schedule from the total number of training steps.
+
+    Returns:
+        A tuple `(wait_steps, warmup_steps, active_steps, repeat)` for
+        `torch.profiler.schedule(...)`.
+
+    Terms:
+        - `wait_steps`: steps to skip before profiling starts (avoid startup noise).
+        - `warmup_steps`: steps where profiler is enabled but events are not recorded
+          into the final trace yet (let kernels/caches settle).
+        - `active_steps`: steps that are actually recorded.
+        - `repeat`: how many times this `(wait + warmup + active)` cycle is repeated.
+
+    Logic:
+        - For tiny runs (`total_steps <= 2`), profile everything:
+          `wait=0`, `warmup=0`, `active=total_steps`.
+        - Otherwise use a stable default: `wait=1`, `warmup=1`.
+        - Keep `active_steps` bounded by `max_active`, but never below 1 and never
+          beyond remaining steps after wait+warmup.
+        - Compute one cycle length as `wait + warmup + active`.
+        - Set `repeat` from how many full cycles fit into `total_steps`, clamped to `[1, 4]`
+          to avoid creating too many trace files while still capturing repeated patterns.
+
+    Example:
+        If `total_steps=120` and `max_active=10`, then:
+        `wait=1`, `warmup=1`, `active=10`, cycle=12, `repeat=min(4, 120//12)=4`.
+    """
+    total_steps = max(1, total_steps)
+    if total_steps <= 2:
+        wait_steps = 0
+        warmup_steps = 0
+        active_steps = total_steps
+    else:
+        wait_steps = 1
+        warmup_steps = 1
+        active_steps = min(max_active, total_steps - wait_steps - warmup_steps)
+        active_steps = max(1, active_steps)
+
+    cycle_steps = wait_steps + warmup_steps + active_steps
+    repeat = max(1, min(4, total_steps // cycle_steps))
+    return wait_steps, warmup_steps, active_steps, repeat
+
+
 def set_seed(seed: int = 42) -> None:
     """
     Sets random seed for reproducibility in distributed training
@@ -121,8 +165,15 @@ def train_loop(  # noqa
     total_start = time.perf_counter()
 
     model.train()
-    active_steps = min(10, len(data))
-    profiler_cm = pt_profiler(profile_dir, active_steps)
+    total_steps = epochs * len(data)
+    wait_steps, warmup_steps, active_steps, repeat = _build_profiler_config(total_steps)
+    profiler_cm = pt_profiler(
+        profile_dir,
+        active_steps=active_steps,
+        wait_steps=wait_steps,
+        warmup_steps=warmup_steps,
+        repeat=repeat,
+    )
 
     # Use CUDA events for GPU timings without forcing full device syncs.
     if log_on_rank0:
@@ -155,18 +206,19 @@ def train_loop(  # noqa
                 if log_on_rank0:
                     move_end_event.record()
 
-                if grad_accum_steps is not None:
-                    model, optimizer, loss = train_step_with_hook_ga_async(
-                        batch,
-                        model,
-                        optimizer,
-                        grad_accum_steps,
-                        batch_idx,
-                        is_async=is_async,
-                        is_hook=is_hook,
-                    )
-                else:
-                    model, optimizer, loss = train_step(batch, model, optimizer)
+                with torch.profiler.record_function("train_step"):
+                    if grad_accum_steps is not None:
+                        model, optimizer, loss = train_step_with_hook_ga_async(
+                            batch,
+                            model,
+                            optimizer,
+                            grad_accum_steps,
+                            batch_idx,
+                            is_async=is_async,
+                            is_hook=is_hook,
+                        )
+                    else:
+                        model, optimizer, loss = train_step(batch, model, optimizer)
 
                 if log_step_memory:
                     print_memory_snapshot(
@@ -247,6 +299,126 @@ def train_loop(  # noqa
             f"(avg {avg_time_per_batch:.3f}s per batch)"
         )
     return model
+
+
+def train_loop_pp(
+    engine,
+    data,
+    device,
+    epochs,
+    profile_dir,
+    memory_log_interval=0,
+):
+    """Train a PP engine with timing, profiling, and memory logging."""
+    rank, _, _ = get_dist_info()
+    pp_group = None
+    if hasattr(engine, "pp_group"):
+        pp_group = engine.pp_group
+    elif hasattr(engine, "pipeline_impl"):
+        pp_group = getattr(engine.pipeline_impl, "pp_group", None)
+    if pp_group is None:
+        pp_group = dist.group.WORLD
+    pp_rank = dist.get_rank(pp_group)
+    pp_world_size = dist.get_world_size(pp_group)
+    log_on_last = pp_rank == pp_world_size - 1
+
+    total_batches = 0
+    total_start = time.perf_counter()
+
+    total_steps = epochs * len(data)
+    wait_steps, warmup_steps, active_steps, repeat = _build_profiler_config(total_steps)
+    profiler_cm = pt_profiler(
+        profile_dir,
+        active_steps=active_steps,
+        wait_steps=wait_steps,
+        warmup_steps=warmup_steps,
+        repeat=repeat,
+    )
+
+    if log_on_last:
+        batch_start_event = torch.cuda.Event(enable_timing=True)
+        batch_end_event = torch.cuda.Event(enable_timing=True)
+
+    with profiler_cm as profiler:
+        for epoch in range(epochs):
+            data.sampler.set_epoch(epoch)
+            reset_cuda_peak_memory(device)
+            epoch_start = time.perf_counter()
+            epoch_batch_times = []
+            epoch_loss_sum = 0.0
+            epoch_loss_steps = 0
+
+            for batch_idx, batch in enumerate(data, start=1):
+                batch_time = 0.0
+                log_step_memory = memory_log_interval > 0 and batch_idx % memory_log_interval == 0
+
+                if log_on_last:
+                    batch_start_event.record()
+
+                with torch.profiler.record_function("pp.train_batch"):
+                    step_loss = engine.train_batch(batch)
+
+                if log_step_memory:
+                    print_memory_snapshot(
+                        prefix=f"Epoch {epoch + 1} Batch {batch_idx}",
+                        model=engine.model_for_memory,
+                        optimizer=engine.optimizer,
+                        rank=rank,
+                        device=device,
+                        sync_cuda=True,
+                    )
+
+                if log_on_last and step_loss is not None:
+                    epoch_loss_sum += step_loss
+                    epoch_loss_steps += 1
+
+                if log_on_last:
+                    batch_end_event.record()
+                    batch_end_event.synchronize()
+                    batch_time = batch_start_event.elapsed_time(batch_end_event) / 1000.0
+                    epoch_batch_times.append(batch_time)
+
+                total_batches += 1
+                profiler.step()
+
+                if log_on_last:
+                    loss_text = f"{step_loss:.4f}" if step_loss is not None else "n/a"
+                    print(
+                        f"[Epoch {epoch + 1}/{epochs}] "
+                        f"[Batch {batch_idx}/{len(data)}] "
+                        f"batch_time={batch_time:.3f}s "
+                        f"loss={loss_text}"
+                    )
+
+            epoch_time = time.perf_counter() - epoch_start
+            avg_batch_time = (
+                sum(epoch_batch_times) / len(epoch_batch_times) if epoch_batch_times else 0.0
+            )
+            avg_loss = epoch_loss_sum / max(1, epoch_loss_steps)
+
+            if log_on_last:
+                print(
+                    f"[Epoch {epoch + 1}] epoch_time={epoch_time:.3f}s "
+                    f"avg_batch_time={avg_batch_time:.3f}s "
+                    f"avg_loss={avg_loss:.4f}"
+                )
+
+            print_memory_snapshot(
+                prefix=f"Epoch {epoch + 1} end",
+                model=engine.model_for_memory,
+                optimizer=engine.optimizer,
+                rank=rank,
+                device=device,
+                sync_cuda=True,
+            )
+
+    total_time = time.perf_counter() - total_start
+    avg_time_per_batch = total_time / total_batches if total_batches else 0.0
+    if log_on_last:
+        print(
+            f"Training completed in {total_time:.3f}s across {total_batches} batches "
+            f"(avg {avg_time_per_batch:.3f}s per batch)"
+        )
 
 
 def evaluate(model, data_loader, device):
