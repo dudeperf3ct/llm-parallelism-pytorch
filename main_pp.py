@@ -67,8 +67,6 @@ def build_stage_module(
     model: torch.nn.Module,
     num_stages: int,
     rank: int,
-    *,
-    propagate_attention_mask: bool,
 ):
     """Build one DistilBERT stage module for either scratch or PyTorch PP."""
     layers = get_pp_layers(model)
@@ -82,10 +80,38 @@ def build_stage_module(
             super().__init__()
             self.embeddings = model.distilbert.embeddings if is_first else None
             self.layers = nn.ModuleList(layers[start:end])
-            self.propagate_attention_mask = propagate_attention_mask and not is_last
             self.pre_classifier = getattr(model, "pre_classifier", None) if is_last else None
             self.dropout = getattr(model, "dropout", None) if is_last else None
             self.classifier = getattr(model, "classifier", None) if is_last else None
+            self._attention_mask_chunks: tuple[torch.Tensor, ...] = ()
+            self._next_mask_idx = 0
+
+        def prepare_microbatch_attention_mask(
+            self, attention_mask: torch.Tensor, num_microbatches: int
+        ) -> None:
+            """Cache the local attention-mask chunks for PyTorch PP schedules."""
+            device = next(self.parameters()).device
+            self._attention_mask_chunks = tuple(
+                chunk.to(device, non_blocking=True)
+                for chunk in attention_mask.chunk(num_microbatches, dim=0)
+            )
+            self._next_mask_idx = 0
+
+        def _resolve_attention_mask(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+        ) -> torch.Tensor:
+            """Use explicit mask when present, otherwise consume the next cached chunk."""
+            if attention_mask is None:
+                if self._next_mask_idx < len(self._attention_mask_chunks):
+                    attention_mask = self._attention_mask_chunks[self._next_mask_idx]
+                    self._next_mask_idx += 1
+                else:
+                    attention_mask = torch.ones(
+                        hidden_states.shape[:2], device=hidden_states.device, dtype=torch.bool
+                    )
+            return attention_mask
 
         def forward(self, x, attention_mask=None):
             """Run this stage shard.
@@ -100,14 +126,10 @@ def build_stage_module(
             # Stage 0: token ids [B, S] -> embeddings [B, S, H].
             # Other stages: x is already hidden states [B, S, H].
             hidden_states = self.embeddings(x) if self.embeddings is not None else x
-            if attention_mask is None:
-                attention_mask_2d = torch.ones(
-                    hidden_states.shape[:2], device=hidden_states.device, dtype=torch.bool
-                )
-            else:
-                attention_mask_2d = attention_mask.to(
-                    hidden_states.device, dtype=torch.bool, non_blocking=True
-                )
+            attention_mask = self._resolve_attention_mask(hidden_states, attention_mask)
+            attention_mask_2d = attention_mask.to(
+                hidden_states.device, dtype=torch.bool, non_blocking=True
+            )
             attention_mask = attention_mask_2d
             if model.config._attn_implementation == "sdpa":
                 attention_mask = _prepare_4d_attention_mask_for_sdpa(
@@ -129,11 +151,6 @@ def build_stage_module(
                 if self.dropout is not None:
                     pooled_output = self.dropout(pooled_output)
                 return self.classifier(pooled_output)
-            if self.propagate_attention_mask:
-                # PipelineStage marks received tensors as requiring grad, which is only
-                # valid for floating tensors. Send the mask as float and cast back to
-                # bool on the next stage.
-                return hidden_states, attention_mask_2d.to(hidden_states.dtype)
             # Scratch stages send hidden states [B, S, H] only.
             return hidden_states
 
@@ -146,7 +163,6 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
         model,
         num_stages,
         rank,
-        propagate_attention_mask=False,
     )
 
 
@@ -168,7 +184,6 @@ def build_pytorch_stage(
         model,
         dist.get_world_size(pp_group),
         rank,
-        propagate_attention_mask=True,
     )
     stage_module = stage_module.to(device)
     stage = PipelineStage(

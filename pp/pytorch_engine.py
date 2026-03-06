@@ -28,6 +28,12 @@ class PytorchPPEngine(BasePPEngine):
         with torch.profiler.record_function("pp.optimizer_zero_grad"):
             self._optimizer.zero_grad(set_to_none=True)
         losses = []
+        stage_module = getattr(getattr(self.schedule, "_stage", None), "submod", None)
+        if hasattr(stage_module, "prepare_microbatch_attention_mask"):
+            stage_module.prepare_microbatch_attention_mask(
+                batch["attention_mask"].to(self.device, non_blocking=True),
+                self.schedule._n_microbatches,
+            )
 
         # For pipeline parallel training,
         # we need to call schedule.step() with the appropriate inputs and targets
@@ -37,7 +43,6 @@ class PytorchPPEngine(BasePPEngine):
             with torch.profiler.record_function("pp.forward"):
                 self.schedule.step(
                     batch["input_ids"].to(self.device, non_blocking=True),
-                    attention_mask=batch["attention_mask"].to(self.device, non_blocking=True),
                     target=batch["labels"].to(self.device, non_blocking=True),
                     losses=losses,
                 )
@@ -45,7 +50,6 @@ class PytorchPPEngine(BasePPEngine):
             with torch.profiler.record_function("pp.forward"):
                 self.schedule.step(
                     batch["input_ids"].to(self.device, non_blocking=True),
-                    attention_mask=batch["attention_mask"].to(self.device, non_blocking=True),
                 )
         elif self.is_last:
             with torch.profiler.record_function("pp.forward"):
