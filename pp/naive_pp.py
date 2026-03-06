@@ -48,7 +48,8 @@ class NaivePipeline(BasePipeline):
             torch.empty(grad_shape, dtype=act_dtype, device=self.device) if grad_shape else None
         )
         # Responsible for peak memory
-        self._saved_activation = None
+        self._saved_input = None
+        self._saved_output = None
         self.loss = None
 
     def _recv(self, buf: torch.Tensor, src: int) -> torch.Tensor:
@@ -113,7 +114,7 @@ class NaivePipeline(BasePipeline):
                 input_ids = batch["input_ids"].to(self.device, non_blocking=True)
                 attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
                 out = self.stage_module(input_ids, attention_mask)
-                self._saved_activation = out
+                self._saved_output = out
                 self._send(out, dst=self.stage + 1)
             # Last stage, we receive the activations from the previous stage,
             # run the forward pass to get logits and calculate the loss with the labels.
@@ -122,7 +123,7 @@ class NaivePipeline(BasePipeline):
                 # Explicitly marking require grads as cross rank communication breaks autograd history
                 buf = buf.detach()
                 buf.requires_grad_()
-                self._saved_activation = buf
+                self._saved_input = buf
                 attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
                 logits = self.stage_module(buf, attention_mask=attention_mask)
                 labels = batch["labels"].to(self.device, non_blocking=True)
@@ -134,9 +135,10 @@ class NaivePipeline(BasePipeline):
                 # Explicitly marking require grads as cross rank communication breaks autograd history
                 buf = buf.detach()
                 buf.requires_grad_()
-                self._saved_activation = buf
+                self._saved_input = buf
                 attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
                 out = self.stage_module(buf, attention_mask=attention_mask)
+                self._saved_output = out
                 self._send(out, dst=self.stage + 1)
 
         def backward_step() -> None:
@@ -145,22 +147,22 @@ class NaivePipeline(BasePipeline):
             # then sends the input gradient to the previous stage.
             if self.is_last:
                 self.loss.backward()
-                grad_to_send = self._saved_activation.grad
+                grad_to_send = self._saved_input.grad
                 self._send(grad_to_send, dst=self.stage - 1)
             # Intermediate stage receives the input gradient from the next stage,
             # runs backward on the intermediate activation,
             # and sends the gradient of the input activation to the previous stage.
             elif not self.is_first:
                 grad_to_recv = self._recv(buf=self.bwd_cache, src=self.stage + 1)
-                self._saved_activation.backward(grad_to_recv)
-                grad_to_send = self._saved_activation.grad
+                self._saved_output.backward(grad_to_recv)
+                grad_to_send = self._saved_input.grad
                 self._send(grad_to_send, dst=self.stage - 1)
             # First stage receives the input gradient from the next stage
             # and runs backward on the input activation.
             else:
                 grad_to_recv = self._recv(buf=self.bwd_cache, src=self.stage + 1)
                 # For stage 0, saved activation is the output we sent onward.
-                self._saved_activation.backward(grad_to_recv)
+                self._saved_output.backward(grad_to_recv)
 
         # Forward pass and calculate loss
         with torch.profiler.record_function("pp.forward"):
@@ -173,7 +175,8 @@ class NaivePipeline(BasePipeline):
         # Optimizer step for particular stage
         with torch.profiler.record_function("pp.optimizer_step"):
             self.stage_opt.step()
-        self._saved_activation = None
+        self._saved_input = None
+        self._saved_output = None
         final_loss = self.loss.item() if self.is_last and self.loss is not None else None
         self.loss = None
         return final_loss

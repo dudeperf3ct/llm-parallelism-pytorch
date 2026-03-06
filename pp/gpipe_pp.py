@@ -51,7 +51,8 @@ class GPipePipeline(BasePipeline):
             torch.empty(grad_shape, dtype=act_dtype, device=self.device) if grad_shape else None
             for _ in range(self.num_microbatches)
         ]
-        self._saved_activation = [None] * self.num_microbatches
+        self._saved_input = [None] * self.num_microbatches
+        self._saved_output = [None] * self.num_microbatches
         self.losses = [None] * self.num_microbatches
 
     def _recv(self, buf: torch.Tensor, src: int) -> torch.Tensor:
@@ -127,7 +128,7 @@ class GPipePipeline(BasePipeline):
                 input_ids = micro_batch["input_ids"].to(self.device, non_blocking=True)
                 attention_mask = micro_batch["attention_mask"].to(self.device, non_blocking=True)
                 out = self.stage_module(input_ids, attention_mask)
-                self._saved_activation[micro_batch_idx] = out
+                self._saved_output[micro_batch_idx] = out
                 self._send(out, dst=self.stage + 1)
             # Last stage, we receive the activations from the previous stage,
             # run the forward pass to get logits and calculate the loss with the labels.
@@ -135,7 +136,7 @@ class GPipePipeline(BasePipeline):
                 buf = self._recv(buf=self.fwd_cache[micro_batch_idx], src=self.stage - 1)
                 buf = buf.detach()
                 buf.requires_grad_()
-                self._saved_activation[micro_batch_idx] = buf
+                self._saved_input[micro_batch_idx] = buf
                 attention_mask = micro_batch["attention_mask"].to(self.device, non_blocking=True)
                 logits = self.stage_module(buf, attention_mask=attention_mask)
                 labels = micro_batch["labels"].to(self.device, non_blocking=True)
@@ -148,9 +149,10 @@ class GPipePipeline(BasePipeline):
                 buf = self._recv(buf=self.fwd_cache[micro_batch_idx], src=self.stage - 1)
                 buf = buf.detach()
                 buf.requires_grad_()
-                self._saved_activation[micro_batch_idx] = buf
+                self._saved_input[micro_batch_idx] = buf
                 attention_mask = micro_batch["attention_mask"].to(self.device, non_blocking=True)
                 out = self.stage_module(buf, attention_mask=attention_mask)
+                self._saved_output[micro_batch_idx] = out
                 self._send(out, dst=self.stage + 1)
 
         def backward_micro(micro_batch_idx: int) -> None:
@@ -160,22 +162,22 @@ class GPipePipeline(BasePipeline):
             if self.is_last:
                 # Match full-batch mean-loss scaling across microbatches.
                 (self.losses[micro_batch_idx] / self.num_microbatches).backward()
-                grad_to_send = self._saved_activation[micro_batch_idx].grad
+                grad_to_send = self._saved_input[micro_batch_idx].grad
                 self._send(grad_to_send, dst=self.stage - 1)
             # Intermediate stage receives the input gradient from the next stage,
             # runs backward on the intermediate activation,
             # and sends the gradient of the input activation to the previous stage.
             elif not self.is_first:
                 grad_to_recv = self._recv(buf=self.bwd_cache[micro_batch_idx], src=self.stage + 1)
-                self._saved_activation[micro_batch_idx].backward(grad_to_recv)
-                grad_to_send = self._saved_activation[micro_batch_idx].grad
+                self._saved_output[micro_batch_idx].backward(grad_to_recv)
+                grad_to_send = self._saved_input[micro_batch_idx].grad
                 self._send(grad_to_send, dst=self.stage - 1)
             # First stage receives the input gradient from the next stage
             # and runs backward on the input activation.
             else:
                 grad_to_recv = self._recv(buf=self.bwd_cache[micro_batch_idx], src=self.stage + 1)
                 # For stage 0, saved activation is the output we sent onward.
-                self._saved_activation[micro_batch_idx].backward(grad_to_recv)
+                self._saved_output[micro_batch_idx].backward(grad_to_recv)
 
         # Forward pass and calculate loss
         with torch.profiler.record_function("pp.forward"):
@@ -190,7 +192,8 @@ class GPipePipeline(BasePipeline):
         # Optimizer step for particular stage
         with torch.profiler.record_function("pp.optimizer_step"):
             self.stage_opt.step()
-        self._saved_activation = [None] * self.num_microbatches
+        self._saved_input = [None] * self.num_microbatches
+        self._saved_output = [None] * self.num_microbatches
         final_loss = None
         if self.is_last:
             loss_vals = [loss.detach() for loss in self.losses if loss is not None]

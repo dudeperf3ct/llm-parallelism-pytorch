@@ -72,6 +72,8 @@ class OneFOneBPipeline(BasePipeline):
             torch.empty(grad_shape, dtype=act_dtype, device=self.device) if grad_shape else None
             for _ in range(self.num_microbatches)
         ]
+        self._saved_input = [None] * self.num_microbatches
+        self._saved_output = [None] * self.num_microbatches
 
     def _recv(self, buf: torch.Tensor, src: int) -> torch.Tensor:
         """Receive a tensor from `src` into a preallocated buffer.
@@ -130,7 +132,6 @@ class OneFOneBPipeline(BasePipeline):
         chunks = {k: v.chunk(self.num_microbatches, dim=0) for k, v in batch.items()}
         micro_batches = [{k: chunks[k][i] for k in chunks} for i in range(self.num_microbatches)]
 
-        self._saved_activation = [None] * self.num_microbatches
         self.losses = [None] * self.num_microbatches
 
         def forward_micro(micro_batch_idx: int) -> None:
@@ -143,7 +144,7 @@ class OneFOneBPipeline(BasePipeline):
                 input_ids = micro_batch["input_ids"].to(self.device, non_blocking=True)
                 attention_mask = micro_batch["attention_mask"].to(self.device, non_blocking=True)
                 out = self.stage_module(input_ids, attention_mask=attention_mask)
-                self._saved_activation[micro_batch_idx] = out
+                self._saved_output[micro_batch_idx] = out
                 if not self.is_last:
                     self._send(out, dst=self.stage + 1)
             # Last stage, we receive the activations from the previous stage,
@@ -154,7 +155,7 @@ class OneFOneBPipeline(BasePipeline):
                 buf = self._recv(buf=self.fwd_cache[micro_batch_idx], src=self.stage - 1)
                 buf = buf.detach()
                 buf.requires_grad_()
-                self._saved_activation[micro_batch_idx] = buf
+                self._saved_input[micro_batch_idx] = buf
 
                 attention_mask = micro_batch["attention_mask"].to(self.device, non_blocking=True)
                 out = self.stage_module(buf, attention_mask=attention_mask)
@@ -165,6 +166,7 @@ class OneFOneBPipeline(BasePipeline):
                         out, labels, attention_mask=attention_mask
                     )
                 else:
+                    self._saved_output[micro_batch_idx] = out
                     self._send(out, dst=self.stage + 1)
 
         def backward_micro(micro_batch_idx: int) -> None:
@@ -175,7 +177,7 @@ class OneFOneBPipeline(BasePipeline):
                 # Match full-batch mean-loss scaling across microbatches.
                 (self.losses[micro_batch_idx] / self.num_microbatches).backward()
                 if not self.is_first:
-                    self._send(self._saved_activation[micro_batch_idx].grad, dst=self.stage - 1)
+                    self._send(self._saved_input[micro_batch_idx].grad, dst=self.stage - 1)
             # Intermediate stage receives the input gradient from the next stage,
             # runs backward on the intermediate activation,
             # and sends the gradient of the input activation to the previous stage.
@@ -183,9 +185,9 @@ class OneFOneBPipeline(BasePipeline):
             # and runs backward on the input activation.
             else:
                 grad_to_recv = self._recv(buf=self.bwd_cache[micro_batch_idx], src=self.stage + 1)
-                self._saved_activation[micro_batch_idx].backward(grad_to_recv)
+                self._saved_output[micro_batch_idx].backward(grad_to_recv)
                 if not self.is_first:
-                    self._send(self._saved_activation[micro_batch_idx].grad, dst=self.stage - 1)
+                    self._send(self._saved_input[micro_batch_idx].grad, dst=self.stage - 1)
 
         # A stage can only start backward after gradients arrive from downstream stages.
         # Earlier stages therefore need more forward-only warmup steps than later stages.
@@ -222,6 +224,7 @@ class OneFOneBPipeline(BasePipeline):
         if self.is_last:
             loss_vals = [loss.detach() for loss in self.losses if loss is not None]
             final_loss = torch.stack(loss_vals).mean().item() if loss_vals else None
-        self._saved_activation = [None] * self.num_microbatches
+        self._saved_input = [None] * self.num_microbatches
+        self._saved_output = [None] * self.num_microbatches
         self.losses = [None] * self.num_microbatches
         return final_loss
