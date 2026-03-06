@@ -16,7 +16,7 @@ Model choice by experiment:
 
 **Sharding**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.78/hour as of Feburary 2026. It costs about $2 to complete these experiments.
 
-**Pipeline**: I used a 8 x Nvidia Tesla V100 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $1.59/hour as of March 2026.
+**Pipeline**: I used a 3 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $1.18/hour as of March 2026.
 
 
 ## Requirements

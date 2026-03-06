@@ -94,10 +94,13 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
             hidden_states = self.embeddings(x) if self.embeddings is not None else x
             if attention_mask is None:
                 attention_mask = torch.ones(
-                    hidden_states.shape[:2], device=hidden_states.device, dtype=torch.long
+                    hidden_states.shape[:2], device=hidden_states.device, dtype=torch.bool
                 )
             else:
-                attention_mask = attention_mask.to(hidden_states.device, non_blocking=True)
+                # DistilBERT block-level attention expects bool/float masks, not int64.
+                attention_mask = attention_mask.to(
+                    hidden_states.device, dtype=torch.bool, non_blocking=True
+                )
 
             for layer in self.layers:
                 # Decoder block preserves hidden shape: [B, S, H] -> [B, S, H].
