@@ -5,6 +5,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.pipelining import Schedule1F1B, ScheduleGPipe, SplitPoint, pipeline
+from transformers.models.distilbert.modeling_distilbert import _prepare_4d_attention_mask_for_sdpa
 
 from data import prepare_data
 from model import get_pp_model, get_pp_tokenizer
@@ -97,13 +98,18 @@ def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
                     hidden_states.shape[:2], device=hidden_states.device, dtype=torch.bool
                 )
             else:
-                # DistilBERT block-level attention expects bool/float masks, not int64.
                 attention_mask = attention_mask.to(
                     hidden_states.device, dtype=torch.bool, non_blocking=True
                 )
+            if model.config._attn_implementation == "sdpa":
+                attention_mask = _prepare_4d_attention_mask_for_sdpa(
+                    attention_mask,
+                    hidden_states.dtype,
+                    tgt_len=hidden_states.shape[1],
+                )
 
             for layer in self.layers:
-                # Decoder block preserves hidden shape: [B, S, H] -> [B, S, H].
+                # Encoder block preserves hidden shape: [B, S, H] -> [B, S, H].
                 out = layer(hidden_states, attn_mask=attention_mask)
                 hidden_states = out[0] if isinstance(out, tuple) else out
 
