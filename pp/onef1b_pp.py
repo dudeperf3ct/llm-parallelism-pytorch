@@ -64,11 +64,11 @@ class OneFOneBPipeline(BasePipeline):
         super().__init__(stage, num_stages, module, optimizer, loss_fn, num_microbatches)
         self.pp_group = pp_group
         self.device = device if device is not None else torch.device(f"cuda:{stage}")
-        self.fwd_cache = [
+        self.activation_recv_buffers = [
             torch.empty(in_shape, dtype=act_dtype, device=self.device) if in_shape else None
             for _ in range(self.num_microbatches)
         ]
-        self.bwd_cache = [
+        self.gradient_recv_buffers = [
             torch.empty(grad_shape, dtype=act_dtype, device=self.device) if grad_shape else None
             for _ in range(self.num_microbatches)
         ]
@@ -152,7 +152,9 @@ class OneFOneBPipeline(BasePipeline):
             # Intermediate stage, we receive the activations from the previous stage,
             # run the forward pass, and send the activations to the next stage.
             else:
-                buf = self._recv(buf=self.fwd_cache[micro_batch_idx], src=self.stage - 1)
+                buf = self._recv(
+                    buf=self.activation_recv_buffers[micro_batch_idx], src=self.stage - 1
+                )
                 buf = buf.detach()
                 buf.requires_grad_()
                 self._saved_input[micro_batch_idx] = buf
@@ -184,7 +186,9 @@ class OneFOneBPipeline(BasePipeline):
             # First stage receives the input gradient from the next stage
             # and runs backward on the input activation.
             else:
-                grad_to_recv = self._recv(buf=self.bwd_cache[micro_batch_idx], src=self.stage + 1)
+                grad_to_recv = self._recv(
+                    buf=self.gradient_recv_buffers[micro_batch_idx], src=self.stage + 1
+                )
                 self._saved_output[micro_batch_idx].backward(grad_to_recv)
                 if not self.is_first:
                     self._send(self._saved_input[micro_batch_idx].grad, dst=self.stage - 1)

@@ -41,10 +41,10 @@ class NaivePipeline(BasePipeline):
         self.pp_group = pp_group
         self.device = device if device is not None else torch.device(f"cuda:{stage}")
         # Placeholders used to recieve
-        self.fwd_cache = (
+        self.activation_recv_buffer = (
             torch.empty(in_shape, dtype=act_dtype, device=self.device) if in_shape else None
         )
-        self.bwd_cache = (
+        self.gradient_recv_buffer = (
             torch.empty(grad_shape, dtype=act_dtype, device=self.device) if grad_shape else None
         )
         # Responsible for peak memory
@@ -119,7 +119,7 @@ class NaivePipeline(BasePipeline):
             # Last stage, we receive the activations from the previous stage,
             # run the forward pass to get logits and calculate the loss with the labels.
             elif self.is_last:
-                buf = self._recv(buf=self.fwd_cache, src=self.stage - 1)
+                buf = self._recv(buf=self.activation_recv_buffer, src=self.stage - 1)
                 # Explicitly marking require grads as cross rank communication breaks autograd history
                 buf = buf.detach()
                 buf.requires_grad_()
@@ -131,7 +131,7 @@ class NaivePipeline(BasePipeline):
             # Intermediate stage, we receive the activations from the previous stage,
             # run the forward pass, and send the activations to the next stage.
             else:
-                buf = self._recv(buf=self.fwd_cache, src=self.stage - 1)
+                buf = self._recv(buf=self.activation_recv_buffer, src=self.stage - 1)
                 # Explicitly marking require grads as cross rank communication breaks autograd history
                 buf = buf.detach()
                 buf.requires_grad_()
@@ -153,14 +153,14 @@ class NaivePipeline(BasePipeline):
             # runs backward on the intermediate activation,
             # and sends the gradient of the input activation to the previous stage.
             elif not self.is_first:
-                grad_to_recv = self._recv(buf=self.bwd_cache, src=self.stage + 1)
+                grad_to_recv = self._recv(buf=self.gradient_recv_buffer, src=self.stage + 1)
                 self._saved_output.backward(grad_to_recv)
                 grad_to_send = self._saved_input.grad
                 self._send(grad_to_send, dst=self.stage - 1)
             # First stage receives the input gradient from the next stage
             # and runs backward on the input activation.
             else:
-                grad_to_recv = self._recv(buf=self.bwd_cache, src=self.stage + 1)
+                grad_to_recv = self._recv(buf=self.gradient_recv_buffer, src=self.stage + 1)
                 # For stage 0, saved activation is the output we sent onward.
                 self._saved_output.backward(grad_to_recv)
 

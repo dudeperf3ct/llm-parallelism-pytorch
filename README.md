@@ -218,5 +218,14 @@ Optional flags for both scripts:
 - `--select all` to analyze each trace window and save under `run_<idx>_<ts>/`.
 - `--enable-multiprocessing` to parse traces with multiprocessing.
 
+### Pipeline parallel traces
+```bash
+python scripts/analyze_traces_pp.py --trace-dir profile_pp/pytorch_gpipe_pp --select latest
+```
+
+Output is inferred by replacing `profile_pp/` with `reports_pp/` when applicable. For the above command:
+- `reports_pp/pytorch_gpipe_pp/summary.html`
+- `reports_pp/pytorch_gpipe_pp/summary.csv`
+
 >[!NOTE]
 > Each experiment produces a trace file for each rank that can be viewed at [perfetto UI](https://ui.perfetto.dev/). This provides detailed breakdown of CUDA streams and CPU threads. It shows the compute time for all the operations taking place on GPU and CPU.
