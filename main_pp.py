@@ -136,18 +136,29 @@ def build_stage_module(
             # Other stages: x is already hidden states [B, S, H].
             hidden_states = self.embeddings(x) if self.embeddings is not None else x
             self._debug_log(f"after embeddings hidden_shape={tuple(hidden_states.shape)}")
+            self._debug_log(f"before resolve_attention_mask mask_is_none={attention_mask is None}")
             attention_mask = self._resolve_attention_mask(hidden_states, attention_mask)
+            self._debug_log(
+                "after resolve_attention_mask "
+                f"mask_shape={tuple(attention_mask.shape)} "
+                f"mask_device={attention_mask.device} "
+                f"mask_dtype={attention_mask.dtype}"
+            )
+            self._debug_log("before attention_mask.to(bool)")
             attention_mask_2d = attention_mask.to(
                 hidden_states.device, dtype=torch.bool, non_blocking=True
             )
+            self._debug_log("after attention_mask.to(bool)")
             attention_mask = attention_mask_2d
             self._debug_log(f"attention_mask shape={tuple(attention_mask.shape)}")
             if model.config._attn_implementation == "sdpa":
+                self._debug_log("before _prepare_4d_attention_mask_for_sdpa")
                 attention_mask = _prepare_4d_attention_mask_for_sdpa(
                     attention_mask,
                     hidden_states.dtype,
                     tgt_len=hidden_states.shape[1],
                 )
+                self._debug_log("after _prepare_4d_attention_mask_for_sdpa")
                 self._debug_log(f"sdpa_attention_mask shape={tuple(attention_mask.shape)}")
 
             for layer_idx, layer in enumerate(self.layers):
