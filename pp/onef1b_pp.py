@@ -1,7 +1,5 @@
 """1F1B pipeline parallel implementation."""
 
-import os
-
 import torch
 import torch.distributed as dist
 
@@ -76,16 +74,6 @@ class OneFOneBPipeline(BasePipeline):
         ]
         self._saved_input = [None] * self.num_microbatches
         self._saved_output = [None] * self.num_microbatches
-        self.debug_enabled = os.environ.get("PP_DEBUG_1F1B", "0") == "1"
-
-    def _debug_log(self, message: str) -> None:
-        """Emit rank/stage-scoped debug logs when 1F1B debugging is enabled."""
-        if not self.debug_enabled:
-            return
-        print(
-            f"[rank={dist.get_rank(self.pp_group)} stage={self.stage}] {message}",
-            flush=True,
-        )
 
     def _recv(self, buf: torch.Tensor, src: int) -> torch.Tensor:
         """Receive a tensor from `src` into a preallocated buffer.
@@ -100,10 +88,8 @@ class OneFOneBPipeline(BasePipeline):
         Note:
             This is a blocking point-to-point receive (`dist.recv`) scoped to `self.pp_group`.
         """
-        self._debug_log(f"before recv src={src} shape={tuple(buf.shape)}")
         with torch.profiler.record_function("pp.comm.recv"):
             dist.recv(buf, src=src, group=self.pp_group)
-        self._debug_log(f"after recv src={src} shape={tuple(buf.shape)}")
         return buf
 
     def _send(self, inp: torch.Tensor, dst: int) -> None:
@@ -116,10 +102,8 @@ class OneFOneBPipeline(BasePipeline):
         Note:
             This is a blocking point-to-point send (`dist.send`) scoped to `self.pp_group`.
         """
-        self._debug_log(f"before send dst={dst} shape={tuple(inp.shape)}")
         with torch.profiler.record_function("pp.comm.send"):
             dist.send(inp.contiguous(), dst=dst, group=self.pp_group)
-        self._debug_log(f"after send dst={dst} shape={tuple(inp.shape)}")
 
     def run_batch(self, batch):
         """Run one non-interleaved 1F1B step over `num_microbatches`.
@@ -153,7 +137,6 @@ class OneFOneBPipeline(BasePipeline):
         def forward_micro(micro_batch_idx: int) -> None:
             """Run one microbatch forward for this stage."""
             micro_batch = micro_batches[micro_batch_idx]
-            self._debug_log(f"forward_micro start micro={micro_batch_idx}")
 
             # First stage, we run the forward pass on the input batch
             # and send the activations to the next stage.
@@ -190,7 +173,6 @@ class OneFOneBPipeline(BasePipeline):
 
         def backward_micro(micro_batch_idx: int) -> None:
             """Run one microbatch backward for this stage."""
-            self._debug_log(f"backward_micro start micro={micro_batch_idx}")
             # Last stage starts the backward pass by calling `loss.backward()`,
             # then sends the input gradient to the previous stage.
             if self.is_last:
@@ -219,13 +201,11 @@ class OneFOneBPipeline(BasePipeline):
         # Warmup: forward-only.
         with torch.profiler.record_function("pp.forward_warmup"):
             for micro_batch_idx in range(warmup_steps):
-                self._debug_log(f"warmup micro={micro_batch_idx}")
                 forward_micro(micro_batch_idx)
 
         # Steady state: 1 backward + 1 forward per step.
         with torch.profiler.record_function("pp.1f1b_steady"):
             for i in range(steady_steps):
-                self._debug_log(f"steady iter={i} bwd_micro={i} fwd_micro={i + warmup_steps}")
                 if self.is_last:
                     # Last stage has no warmup dependency on backward gradients.
                     forward_micro(i + warmup_steps)
@@ -239,7 +219,6 @@ class OneFOneBPipeline(BasePipeline):
         # Drain: backward-only for remaining micros.
         with torch.profiler.record_function("pp.backward_drain"):
             for micro_batch_idx in range(steady_steps, self.num_microbatches):
-                self._debug_log(f"drain micro={micro_batch_idx}")
                 backward_micro(micro_batch_idx)
 
         # Optimizer step for particular stage

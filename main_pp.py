@@ -1,5 +1,4 @@
 import argparse
-import os
 
 import torch
 import torch.distributed as dist
@@ -86,13 +85,6 @@ def build_stage_module(
             self.classifier = getattr(model, "classifier", None) if is_last else None
             self._attention_mask_chunks: tuple[torch.Tensor, ...] = ()
             self._next_mask_idx = 0
-            self.debug_forward = os.environ.get("PP_DEBUG_STAGE_FORWARD", "0") == "1"
-
-        def _debug_log(self, message: str) -> None:
-            """Emit per-stage forward debug logs when enabled."""
-            if not self.debug_forward:
-                return
-            print(f"[stage_module rank={rank}] {message}", flush=True)
 
         def prepare_microbatch_attention_mask(
             self, attention_mask: torch.Tensor, num_microbatches: int
@@ -131,46 +123,25 @@ def build_stage_module(
             Returns:
                 Hidden states [B, S, H] for non-last stages, or classifier output on last stage.
             """
-            self._debug_log(f"forward start x_shape={tuple(x.shape)}")
             # Stage 0: token ids [B, S] -> embeddings [B, S, H].
             # Other stages: x is already hidden states [B, S, H].
             hidden_states = self.embeddings(x) if self.embeddings is not None else x
-            self._debug_log(f"after embeddings hidden_shape={tuple(hidden_states.shape)}")
-            self._debug_log(f"before resolve_attention_mask mask_is_none={attention_mask is None}")
             attention_mask = self._resolve_attention_mask(hidden_states, attention_mask)
-            self._debug_log(
-                "after resolve_attention_mask "
-                f"mask_shape={tuple(attention_mask.shape)} "
-                f"mask_device={attention_mask.device} "
-                f"mask_dtype={attention_mask.dtype}"
-            )
-            self._debug_log("before attention_mask.to(bool)")
             attention_mask_2d = attention_mask.to(
                 hidden_states.device, dtype=torch.bool, non_blocking=True
             )
-            self._debug_log("after attention_mask.to(bool)")
             attention_mask = attention_mask_2d
-            self._debug_log(f"attention_mask shape={tuple(attention_mask.shape)}")
             if model.config._attn_implementation == "sdpa":
-                self._debug_log("before _prepare_4d_attention_mask_for_sdpa")
                 attention_mask = _prepare_4d_attention_mask_for_sdpa(
                     attention_mask,
                     hidden_states.dtype,
                     tgt_len=hidden_states.shape[1],
                 )
-                self._debug_log("after _prepare_4d_attention_mask_for_sdpa")
-                self._debug_log(f"sdpa_attention_mask shape={tuple(attention_mask.shape)}")
 
-            for layer_idx, layer in enumerate(self.layers):
+            for layer in self.layers:
                 # Encoder block preserves hidden shape: [B, S, H] -> [B, S, H].
-                self._debug_log(
-                    f"before layer={layer_idx} hidden_shape={tuple(hidden_states.shape)}"
-                )
                 out = layer(hidden_states, attn_mask=attention_mask)
                 hidden_states = out[0] if isinstance(out, tuple) else out
-                self._debug_log(
-                    f"after layer={layer_idx} hidden_shape={tuple(hidden_states.shape)}"
-                )
 
             if self.classifier is not None:
                 pooled_output = hidden_states[:, 0]
@@ -179,10 +150,8 @@ def build_stage_module(
                     pooled_output = F.relu(pooled_output)
                 if self.dropout is not None:
                     pooled_output = self.dropout(pooled_output)
-                self._debug_log(f"before classifier pooled_shape={tuple(pooled_output.shape)}")
                 return self.classifier(pooled_output)
             # Scratch stages send hidden states [B, S, H] only.
-            self._debug_log(f"forward end hidden_shape={tuple(hidden_states.shape)}")
             return hidden_states
 
     return ScratchStageModule()
