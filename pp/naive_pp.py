@@ -51,6 +51,27 @@ class NaivePipeline(BasePipeline):
         self._saved_input = None
         self._saved_output = None
         self.loss = None
+        self._p2p_initialized = False
+
+    def _initialize_p2p(self) -> None:
+        """Pre-warm NCCL P2P channels with dummy tensors to avoid lazy-init deadlocks."""
+        if self._p2p_initialized:
+            return
+        dummy = torch.zeros(1, device=self.device)
+        ops: list[dist.P2POp] = []
+        if not self.is_first:
+            ops.append(dist.P2POp(dist.irecv, dummy.clone(), self.stage - 1, self.pp_group))
+        if not self.is_last:
+            ops.append(dist.P2POp(dist.isend, dummy.clone(), self.stage + 1, self.pp_group))
+        if not self.is_last:
+            ops.append(dist.P2POp(dist.irecv, dummy.clone(), self.stage + 1, self.pp_group))
+        if not self.is_first:
+            ops.append(dist.P2POp(dist.isend, dummy.clone(), self.stage - 1, self.pp_group))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for r in reqs:
+                r.wait()
+        self._p2p_initialized = True
 
     def _recv(self, buf: torch.Tensor, src: int) -> torch.Tensor:
         """Receive a tensor from `src` into a preallocated buffer.
@@ -103,6 +124,7 @@ class NaivePipeline(BasePipeline):
         """
         assert self.num_microbatches == 1, "NaivePipeline only supports num_microbatches=1"
 
+        self._initialize_p2p()
         self.stage_opt.zero_grad(set_to_none=True)
         self.loss = None
 
