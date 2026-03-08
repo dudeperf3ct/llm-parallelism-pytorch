@@ -45,6 +45,14 @@ class OneFOneBPipeline(BasePipeline):
         t11:S0[B2] S1[  ] S2[B3] S3[  ]
         t12:S0[  ] S1[B3] S2[  ] S3[  ]
         t13:S0[B3] S1[  ] S2[  ] S3[  ]
+
+    Communication strategy (following PyTorch's ``Schedule1F1B``):
+        Uses ``dist.batch_isend_irecv`` to fuse complementary send+recv ops
+        into a single batched call.  This avoids NCCL deadlocks because:
+        1. All ops in the batch are submitted as one coalesced group, so there
+           is no per-op lazy communicator creation that requires lockstep.
+        2. isend/irecv within a batch are non-blocking and independent, so
+           there is no FIFO serialization conflict on the same communicator.
     """
 
     def __init__(
@@ -74,53 +82,87 @@ class OneFOneBPipeline(BasePipeline):
         ]
         self._saved_input = [None] * self.num_microbatches
         self._saved_output = [None] * self.num_microbatches
-        self._pending_sends: list[dist.Work] = []
 
-    def _recv(self, buf: torch.Tensor, src: int) -> torch.Tensor:
-        """Receive a tensor from `src` into a preallocated buffer.
+    # ── P2P helpers (build ops, don't execute) ────────────────────────
 
-        Args:
-            buf: Destination tensor to write into. Its shape/dtype/device must match sender tensor.
-            src: Source rank within `self.pp_group`.
+    def _fwd_recv_ops(self, micro_batch_idx: int) -> list[dist.P2POp]:
+        """Return irecv op for receiving activation from prev stage."""
+        if self.is_first:
+            return []
+        buf = self.activation_recv_buffers[micro_batch_idx]
+        return [dist.P2POp(dist.irecv, buf, self.stage - 1, self.pp_group)]
 
-        Returns:
-            The same buffer `buf`, filled with received values.
+    def _fwd_send_ops(self, micro_batch_idx: int) -> list[dist.P2POp]:
+        """Return isend op for sending activation to next stage."""
+        if self.is_last:
+            return []
+        out = self._saved_output[micro_batch_idx]
+        return [dist.P2POp(dist.isend, out.contiguous(), self.stage + 1, self.pp_group)]
 
-        Note:
-            This is a blocking point-to-point receive (`dist.recv`) scoped to `self.pp_group`.
-        """
-        with torch.profiler.record_function("pp.comm.recv"):
-            dist.recv(buf, src=src, group=self.pp_group)
-        return buf
+    def _bwd_recv_ops(self, micro_batch_idx: int) -> list[dist.P2POp]:
+        """Return irecv op for receiving gradient from next stage."""
+        if self.is_last:
+            return []
+        buf = self.gradient_recv_buffers[micro_batch_idx]
+        return [dist.P2POp(dist.irecv, buf, self.stage + 1, self.pp_group)]
 
-    def _send(self, inp: torch.Tensor, dst: int) -> None:
-        """Send a tensor to `dst` using non-blocking point-to-point communication.
+    def _bwd_send_ops(self, micro_batch_idx: int) -> list[dist.P2POp]:
+        """Return isend op for sending gradient to prev stage."""
+        if self.is_first:
+            return []
+        grad = self._saved_input[micro_batch_idx].grad
+        return [dist.P2POp(dist.isend, grad.contiguous(), self.stage - 1, self.pp_group)]
 
-        Args:
-            inp: Tensor to send. It is sent as `inp.contiguous()` for communication safety.
-            dst: Destination rank within `self.pp_group`.
+    @staticmethod
+    def _exec_p2p(ops: list[dist.P2POp]) -> None:
+        """Submit batched P2P ops and wait for completion."""
+        if not ops:
+            return
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
 
-        Note:
-            Uses non-blocking `dist.isend` to avoid deadlocks when two stages
-            simultaneously try to send to each other with blocking sends.
-            The work handle is stored in `_pending_sends` and waited on before
-            the optimizer step.
-        """
-        with torch.profiler.record_function("pp.comm.send"):
-            work = dist.isend(inp.contiguous(), dst=dst, group=self.pp_group)
-            self._pending_sends.append(work)
+    # ── Compute helpers (no communication) ────────────────────────────
+
+    def _forward_compute(self, micro_batch_idx: int, micro_batches: list[dict]) -> None:
+        """Run forward computation for one microbatch (no P2P)."""
+        micro_batch = micro_batches[micro_batch_idx]
+
+        if self.is_first:
+            input_ids = micro_batch["input_ids"].to(self.device, non_blocking=True)
+            attention_mask = micro_batch["attention_mask"].to(self.device, non_blocking=True)
+            out = self.stage_module(input_ids, attention_mask=attention_mask)
+            self._saved_output[micro_batch_idx] = out
+        else:
+            buf = self.activation_recv_buffers[micro_batch_idx]
+            buf = buf.detach()
+            buf.requires_grad_()
+            self._saved_input[micro_batch_idx] = buf
+
+            attention_mask = micro_batch["attention_mask"].to(self.device, non_blocking=True)
+            out = self.stage_module(buf, attention_mask=attention_mask)
+
+            if self.is_last:
+                labels = micro_batch["labels"].to(self.device, non_blocking=True)
+                self.losses[micro_batch_idx] = self.loss_fn(
+                    out, labels, attention_mask=attention_mask
+                )
+            else:
+                self._saved_output[micro_batch_idx] = out
+
+    def _backward_compute(self, micro_batch_idx: int) -> None:
+        """Run backward computation for one microbatch (no P2P)."""
+        if self.is_last:
+            (self.losses[micro_batch_idx] / self.num_microbatches).backward()
+        else:
+            grad = self.gradient_recv_buffers[micro_batch_idx]
+            self._saved_output[micro_batch_idx].backward(grad)
 
     def run_batch(self, batch):
         """Run one non-interleaved 1F1B step over `num_microbatches`.
 
-        Training steps:
-            1. Split batch tensors along dim=0 into microbatches.
-            2. Warmup: run `warmup_steps` forward-only micros for this stage.
-            3. Steady state: each step performs one backward micro and one forward micro.
-               (Ordering is backward->forward on non-last stages to avoid deadlocks with
-               blocking point-to-point send/recv.)
-            4. Drain: run remaining backward-only micros.
-            5. Run one optimizer step on this stage.
+        Uses ``batch_isend_irecv`` to fuse complementary send+recv ops,
+        following the same pattern as PyTorch's ``Schedule1F1B``.
 
         Returns:
             Final microbatch loss scalar on last stage, otherwise `None`.
@@ -129,8 +171,6 @@ class OneFOneBPipeline(BasePipeline):
 
         self.stage_opt.zero_grad(set_to_none=True)
 
-        # Chunk the batch into microbatches and perform forward and backward pass
-        # across warmup/steady/drain phases.
         assert batch["input_ids"].size(0) % self.num_microbatches == 0, (
             "Batch size must be divisible by num_microbatches"
         )
@@ -139,97 +179,74 @@ class OneFOneBPipeline(BasePipeline):
 
         self.losses = [None] * self.num_microbatches
 
-        def forward_micro(micro_batch_idx: int) -> None:
-            """Run one microbatch forward for this stage."""
-            micro_batch = micro_batches[micro_batch_idx]
-
-            # First stage, we run the forward pass on the input batch
-            # and send the activations to the next stage.
-            if self.is_first:
-                input_ids = micro_batch["input_ids"].to(self.device, non_blocking=True)
-                attention_mask = micro_batch["attention_mask"].to(self.device, non_blocking=True)
-                out = self.stage_module(input_ids, attention_mask=attention_mask)
-                self._saved_output[micro_batch_idx] = out
-                if not self.is_last:
-                    self._send(out, dst=self.stage + 1)
-            # Last stage, we receive the activations from the previous stage,
-            # run the forward pass to get logits and calculate the loss with the labels.
-            # Intermediate stage, we receive the activations from the previous stage,
-            # run the forward pass, and send the activations to the next stage.
-            else:
-                buf = self._recv(
-                    buf=self.activation_recv_buffers[micro_batch_idx], src=self.stage - 1
-                )
-                buf = buf.detach()
-                buf.requires_grad_()
-                self._saved_input[micro_batch_idx] = buf
-
-                attention_mask = micro_batch["attention_mask"].to(self.device, non_blocking=True)
-                out = self.stage_module(buf, attention_mask=attention_mask)
-
-                if self.is_last:
-                    labels = micro_batch["labels"].to(self.device, non_blocking=True)
-                    self.losses[micro_batch_idx] = self.loss_fn(
-                        out, labels, attention_mask=attention_mask
-                    )
-                else:
-                    self._saved_output[micro_batch_idx] = out
-                    self._send(out, dst=self.stage + 1)
-
-        def backward_micro(micro_batch_idx: int) -> None:
-            """Run one microbatch backward for this stage."""
-            # Last stage starts the backward pass by calling `loss.backward()`,
-            # then sends the input gradient to the previous stage.
-            if self.is_last:
-                # Match full-batch mean-loss scaling across microbatches.
-                (self.losses[micro_batch_idx] / self.num_microbatches).backward()
-                if not self.is_first:
-                    self._send(self._saved_input[micro_batch_idx].grad, dst=self.stage - 1)
-            # Intermediate stage receives the input gradient from the next stage,
-            # runs backward on the intermediate activation,
-            # and sends the gradient of the input activation to the previous stage.
-            # First stage receives the input gradient from the next stage
-            # and runs backward on the input activation.
-            else:
-                grad_to_recv = self._recv(
-                    buf=self.gradient_recv_buffers[micro_batch_idx], src=self.stage + 1
-                )
-                self._saved_output[micro_batch_idx].backward(grad_to_recv)
-                if not self.is_first:
-                    self._send(self._saved_input[micro_batch_idx].grad, dst=self.stage - 1)
-
-        # A stage can only start backward after gradients arrive from downstream stages.
-        # Earlier stages therefore need more forward-only warmup steps than later stages.
         warmup_steps = min(self.num_stages - self.stage - 1, self.num_microbatches)
         steady_steps = self.num_microbatches - warmup_steps
+        fwd_idx = 0
+        bwd_idx = 0
 
-        # Warmup: forward-only.
+        # ── Warmup: forward-only ──────────────────────────────────────
+        # Each iteration: recv activation, compute forward, send activation.
+        fwd_sends: list[dist.P2POp] = []
         with torch.profiler.record_function("pp.forward_warmup"):
-            for micro_batch_idx in range(warmup_steps):
-                forward_micro(micro_batch_idx)
+            for _ in range(warmup_steps):
+                # Recv activation from prev stage (if not first).
+                fwd_recvs = self._fwd_recv_ops(fwd_idx)
+                self._exec_p2p(fwd_recvs)
 
-        # Steady state: 1 backward + 1 forward per step.
+                self._forward_compute(fwd_idx, micro_batches)
+
+                # Send activation to next stage — hold the ops for fusing
+                # with the first backward recv in steady state.
+                fwd_sends = self._fwd_send_ops(fwd_idx)
+                # For all warmup steps except the last, fire immediately.
+                if fwd_idx != warmup_steps - 1:
+                    self._exec_p2p(fwd_sends)
+                    fwd_sends = []
+
+                fwd_idx += 1
+
+        # ── Steady state: 1B + 1F per step ────────────────────────────
+        # Following PyTorch's Schedule1F1B pattern:
+        #   1. Fuse last fwd_send + bwd_recv  →  execute  →  backward compute
+        #   2. Fuse bwd_send + fwd_recv        →  execute  →  forward compute
+        #   3. Save fwd_send for next iteration (or drain)
         with torch.profiler.record_function("pp.1f1b_steady"):
             for i in range(steady_steps):
-                if self.is_last:
-                    # Last stage has no warmup dependency on backward gradients.
-                    forward_micro(i + warmup_steps)
-                    backward_micro(i)
+                # ── Backward half ─────────────────────────────────────
+                # Fuse: send prev forward's activation + recv gradient.
+                bwd_recvs = self._bwd_recv_ops(bwd_idx)
+                self._exec_p2p(fwd_sends + bwd_recvs)
+
+                self._backward_compute(bwd_idx)
+                bwd_sends = self._bwd_send_ops(bwd_idx)
+                bwd_idx += 1
+
+                # ── Forward half ──────────────────────────────────────
+                if fwd_idx < self.num_microbatches:
+                    # Fuse: send gradient + recv next activation.
+                    fwd_recvs = self._fwd_recv_ops(fwd_idx)
+                    self._exec_p2p(bwd_sends + fwd_recvs)
+
+                    self._forward_compute(fwd_idx, micro_batches)
+                    fwd_sends = self._fwd_send_ops(fwd_idx)
+                    fwd_idx += 1
                 else:
-                    # Non-last stages receive gradients first to avoid send/send deadlocks
-                    # with blocking point-to-point communication.
-                    backward_micro(i)
-                    forward_micro(i + warmup_steps)
+                    # No more forwards; just send the gradient.
+                    self._exec_p2p(bwd_sends)
+                    fwd_sends = []
 
-        # Drain: backward-only for remaining micros.
+        # ── Drain: backward-only ──────────────────────────────────────
         with torch.profiler.record_function("pp.backward_drain"):
-            for micro_batch_idx in range(steady_steps, self.num_microbatches):
-                backward_micro(micro_batch_idx)
+            for _ in range(warmup_steps):
+                # Fuse: send prev forward's activation + recv gradient.
+                bwd_recvs = self._bwd_recv_ops(bwd_idx)
+                self._exec_p2p(fwd_sends + bwd_recvs)
+                fwd_sends = []
 
-        # Wait for all non-blocking sends to complete before optimizer step.
-        for work in self._pending_sends:
-            work.wait()
-        self._pending_sends.clear()
+                self._backward_compute(bwd_idx)
+                bwd_sends = self._bwd_send_ops(bwd_idx)
+                self._exec_p2p(bwd_sends)
+                bwd_idx += 1
 
         # Optimizer step for particular stage
         with torch.profiler.record_function("pp.optimizer_step"):
