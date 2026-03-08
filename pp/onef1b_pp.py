@@ -74,6 +74,7 @@ class OneFOneBPipeline(BasePipeline):
         ]
         self._saved_input = [None] * self.num_microbatches
         self._saved_output = [None] * self.num_microbatches
+        self._pending_sends: list[dist.Work] = []
 
     def _recv(self, buf: torch.Tensor, src: int) -> torch.Tensor:
         """Receive a tensor from `src` into a preallocated buffer.
@@ -93,17 +94,21 @@ class OneFOneBPipeline(BasePipeline):
         return buf
 
     def _send(self, inp: torch.Tensor, dst: int) -> None:
-        """Send a tensor to `dst` using point-to-point communication.
+        """Send a tensor to `dst` using non-blocking point-to-point communication.
 
         Args:
             inp: Tensor to send. It is sent as `inp.contiguous()` for communication safety.
             dst: Destination rank within `self.pp_group`.
 
         Note:
-            This is a blocking point-to-point send (`dist.send`) scoped to `self.pp_group`.
+            Uses non-blocking `dist.isend` to avoid deadlocks when two stages
+            simultaneously try to send to each other with blocking sends.
+            The work handle is stored in `_pending_sends` and waited on before
+            the optimizer step.
         """
         with torch.profiler.record_function("pp.comm.send"):
-            dist.send(inp.contiguous(), dst=dst, group=self.pp_group)
+            work = dist.isend(inp.contiguous(), dst=dst, group=self.pp_group)
+            self._pending_sends.append(work)
 
     def run_batch(self, batch):
         """Run one non-interleaved 1F1B step over `num_microbatches`.
@@ -220,6 +225,11 @@ class OneFOneBPipeline(BasePipeline):
         with torch.profiler.record_function("pp.backward_drain"):
             for micro_batch_idx in range(steady_steps, self.num_microbatches):
                 backward_micro(micro_batch_idx)
+
+        # Wait for all non-blocking sends to complete before optimizer step.
+        for work in self._pending_sends:
+            work.wait()
+        self._pending_sends.clear()
 
         # Optimizer step for particular stage
         with torch.profiler.record_function("pp.optimizer_step"):
