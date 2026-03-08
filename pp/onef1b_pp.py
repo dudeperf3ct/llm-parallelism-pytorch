@@ -205,6 +205,16 @@ class OneFOneBPipeline(BasePipeline):
 
                 fwd_idx += 1
 
+        # ── Last-stage first forward ─────────────────────────────────
+        # The last stage has warmup_steps=0, so no forward has run yet.
+        # We must do one forward before the steady-state backward-first loop.
+        if warmup_steps == 0:
+            fwd_recvs = self._fwd_recv_ops(fwd_idx)
+            self._exec_p2p(fwd_recvs)
+            self._forward_compute(fwd_idx, micro_batches)
+            fwd_sends = self._fwd_send_ops(fwd_idx)
+            fwd_idx += 1
+
         # ── Steady state: 1B + 1F per step ────────────────────────────
         # Following PyTorch's Schedule1F1B pattern:
         #   1. Fuse last fwd_send + bwd_recv  →  execute  →  backward compute
