@@ -82,6 +82,35 @@ class OneFOneBPipeline(BasePipeline):
         ]
         self._saved_input = [None] * self.num_microbatches
         self._saved_output = [None] * self.num_microbatches
+        self._p2p_initialized = False
+
+    # ── P2P initialization ──────────────────────────────────────────
+
+    def _initialize_p2p(self) -> None:
+        """Pre-warm NCCL P2P channels by exchanging dummy tensors with neighbors.
+
+        Following PyTorch's ``_get_init_p2p_neighbors_ops``: the first
+        ``batch_isend_irecv`` on a communicator must involve ALL ranks so that
+        NCCL can lazily create the P2P channels without deadlocking.  We send a
+        small dummy in both directions (fwd & bwd) between every pair of
+        adjacent stages in one batched call.
+        """
+        if self._p2p_initialized:
+            return
+        dummy = torch.zeros(1, device=self.device)
+        ops: list[dist.P2POp] = []
+        # Forward direction: recv from prev, send to next
+        if not self.is_first:
+            ops.append(dist.P2POp(dist.irecv, dummy.clone(), self.stage - 1, self.pp_group))
+        if not self.is_last:
+            ops.append(dist.P2POp(dist.isend, dummy.clone(), self.stage + 1, self.pp_group))
+        # Backward direction: recv from next, send to prev
+        if not self.is_last:
+            ops.append(dist.P2POp(dist.irecv, dummy.clone(), self.stage + 1, self.pp_group))
+        if not self.is_first:
+            ops.append(dist.P2POp(dist.isend, dummy.clone(), self.stage - 1, self.pp_group))
+        self._exec_p2p(ops)
+        self._p2p_initialized = True
 
     # ── P2P helpers (build ops, don't execute) ────────────────────────
 
@@ -169,6 +198,7 @@ class OneFOneBPipeline(BasePipeline):
         """
         assert self.num_microbatches > 1, "1F1B requires num_microbatches>1"
 
+        self._initialize_p2p()
         self.stage_opt.zero_grad(set_to_none=True)
 
         assert batch["input_ids"].size(0) % self.num_microbatches == 0, (
