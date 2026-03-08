@@ -79,32 +79,27 @@ class GPipePipeline(BasePipeline):
     def _recv(self, buf: torch.Tensor, src: int) -> torch.Tensor:
         """Receive a tensor from `src` into a preallocated buffer.
 
-        Args:
-            buf: Destination tensor to write into. Its shape/dtype/device must match sender tensor.
-            src: Source rank within `self.pp_group`.
-
-        Returns:
-            The same buffer `buf`, filled with received values.
-
-        Note:
-            This is a blocking point-to-point receive (`dist.recv`) scoped to `self.pp_group`.
+        Uses ``batch_isend_irecv`` (even for a single op) to go through the
+        pre-warmed communicator and avoid lazy per-pair comm creation.
         """
         with torch.profiler.record_function("pp.comm.recv"):
-            dist.recv(buf, src=src, group=self.pp_group)
+            ops = [dist.P2POp(dist.irecv, buf, src, self.pp_group)]
+            reqs = dist.batch_isend_irecv(ops)
+            for r in reqs:
+                r.wait()
         return buf
 
     def _send(self, inp: torch.Tensor, dst: int) -> None:
         """Send a tensor to `dst` using point-to-point communication.
 
-        Args:
-            inp: Tensor to send. It is sent as `inp.contiguous()` for communication safety.
-            dst: Destination rank within `self.pp_group`.
-
-        Note:
-            This is a blocking point-to-point send (`dist.send`) scoped to `self.pp_group`.
+        Uses ``batch_isend_irecv`` (even for a single op) to go through the
+        pre-warmed communicator and avoid lazy per-pair comm creation.
         """
         with torch.profiler.record_function("pp.comm.send"):
-            dist.send(inp.contiguous(), dst=dst, group=self.pp_group)
+            ops = [dist.P2POp(dist.isend, inp.contiguous(), dst, self.pp_group)]
+            reqs = dist.batch_isend_irecv(ops)
+            for r in reqs:
+                r.wait()
 
     def run_batch(self, batch):
         """Run one GPipe fill-and-drain step over `num_microbatches`.
