@@ -17,7 +17,7 @@ from pp.scratch_engine import ScratchPPEngine
 from utils.ddp_utils import ddp_cleanup, ddp_initialize, get_dist_info
 from utils.train_utils import set_seed, train_loop_pp
 
-GLOBAL_BATCH_SIZE = 24
+GLOBAL_BATCH_SIZE = 32
 NUM_MICROBATCHES = 8
 # Create a fixed length dataset to scratch implementation of pipelines easy
 SCRATCH_FIXED_SEQ_LEN = 256
@@ -384,6 +384,6 @@ if __name__ == "__main__":
         memory_log_interval=1,
     )
     if global_rank == 0:
-        print("Pipeline training done. Eval path is not wired yet for stage-only modules.")
+        print("Pipeline training done.")
 
     ddp_cleanup()
