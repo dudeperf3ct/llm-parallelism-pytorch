@@ -1,15 +1,22 @@
 # Distributed Training Experiments
 
-Implement and compare various data parallelism strategies on Yelp Review Full using `HuggingFaceTB/SmolLM2-360M-Instruct`.
+Implement and compare various distributed training strategies on Yelp Review Full.
+
+Model choice by experiment:
+- DDP and sharding use `HuggingFaceTB/SmolLM2-360M-Instruct`.
+- Pipeline parallelism uses `distilbert/distilbert-base-uncased`.
 
 * Data Parallelism write up: https://dudeperf3ct.github.io/posts/implement_data_parallelism/
 * Sharding write up: https://dudeperf3ct.github.io/posts/implement_sharding/
+* Pipeline Parallelism write up: 
 
 ## Costs
 
 **DDP**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.79/hour as of December 2025. It costs about $2.25 to complete these experiments.
 
 **Sharding**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.78/hour as of Feburary 2026. It costs about $2 to complete these experiments.
+
+**Pipeline**: I used a 3 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $1.18/hour as of March 2026.
 
 
 ## Requirements
@@ -41,6 +48,12 @@ To run all implemented strategies in one go:
 ./run_experiment_shard.sh 2
 ```
 
+### Pipeline Parallelism
+
+```bash
+./run_experiment_pp.sh 2
+```
+
 Following sections describe how to run each strategy individually. The `torchrun` CLI sets up the distributed environment variables for you.
 
 ```bash
@@ -55,6 +68,26 @@ Notes:
 - Profiler traces land under `profile/<ddp_choice>/rank_<rank>/`.
 - Logs print only on rank 0
 - You can change `--ddp-choice` to try different strategies: `simple_ddp`, `simple_ddp_ga`, `simple_ddp_hook`, `simple_ddp_async`, `bucket_ddp_async`, `pytorch_ddp`.
+
+## Pipeline Parallelism
+
+Run a specific PP strategy:
+
+```bash
+NUM_GPUS=4
+
+torchrun --standalone --nproc_per_node=$NUM_GPUS main_pp.py --pp-choice naive_pp
+```
+
+Notes:
+- In PP mode, each stage consumes the same samples (model parallel), so data is not sharded by rank.
+- PP uses `distilbert/distilbert-base-uncased` instead of the default SmolLM2 model.
+- The reason is PyTorch's automatic `torch.distributed.pipelining.pipeline(...)` frontend depends on full `torch.export` graph capture, and the current SmolLM2/Llama path hits export graph-break issues on this stack.
+- Even with DistilBERT, the automatic splitter failed here during backward setup with `AssertionError: Backward of skip connections not supported yet`.
+- Because of that, the PyTorch PP path uses manual `PipelineStage` construction instead of automatic splitting. This follows the PyTorch docs recommendation to manually split models when the automatic frontend cannot produce a clean sequential pipeline: https://docs.pytorch.org/docs/main/distributed.pipelining.html#option-1-splitting-a-model-manually
+- Scratch PP modes (`naive_pp`, `gpipe_pp`, `1f1b_pp`) use fixed-shape stage buffers.
+- PyTorch PP modes (`pytorch_gpipe_pp`, `pytorch_1f1b_pp`) use `torch.distributed.pipelining` schedules.
+- Profiler traces land under `profile/<pp_choice>/rank_<rank>/`.
 
 ## NCCL Debugging
 
@@ -184,6 +217,15 @@ Output is inferred by replacing `profile/` with `reports_sharding/` when applica
 Optional flags for both scripts:
 - `--select all` to analyze each trace window and save under `run_<idx>_<ts>/`.
 - `--enable-multiprocessing` to parse traces with multiprocessing.
+
+### Pipeline parallel traces
+```bash
+python scripts/analyze_traces_pp.py --trace-dir profile_pp/pytorch_gpipe_pp --select latest
+```
+
+Output is inferred by replacing `profile_pp/` with `reports_pp/` when applicable. For the above command:
+- `reports_pp/pytorch_gpipe_pp/summary.html`
+- `reports_pp/pytorch_gpipe_pp/summary.csv`
 
 >[!NOTE]
 > Each experiment produces a trace file for each rank that can be viewed at [perfetto UI](https://ui.perfetto.dev/). This provides detailed breakdown of CUDA streams and CPU threads. It shows the compute time for all the operations taking place on GPU and CPU.
