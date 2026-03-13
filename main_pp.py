@@ -30,14 +30,8 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "--pp-choice",
     type=str,
-    choices=[
-        "naive_pp",
-        "gpipe_pp",
-        "1f1b_pp",
-        "pytorch_gpipe_pp",
-        "pytorch_1f1b_pp",
-    ],
-    default="pytorch_gpipe_pp",
+    choices=["naive_pp", "gpipe_pp", "1f1b_pp", "pytorch_gpipe_pp", "pytorch_1f1b_pp"],
+    default="naive_pp",
 )
 args = parser.parse_args()
 
@@ -63,11 +57,7 @@ def stage_bounds(n_layers: int, num_stages: int, rank: int) -> tuple[int, int]:
     return start, end
 
 
-def build_stage_module(
-    model: torch.nn.Module,
-    num_stages: int,
-    rank: int,
-):
+def build_stage_module(model: torch.nn.Module, num_stages: int, rank: int):
     """Build one DistilBERT stage module for either scratch or PyTorch PP."""
     layers = get_pp_layers(model)
     n_layers = len(layers)
@@ -98,9 +88,7 @@ def build_stage_module(
             self._next_mask_idx = 0
 
         def _resolve_attention_mask(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: torch.Tensor | None,
+            self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None
         ) -> torch.Tensor:
             """Use explicit mask when present, otherwise consume the next cached chunk."""
             if attention_mask is None:
@@ -159,40 +147,22 @@ def build_stage_module(
 
 def split_model_for_scratch(model: torch.nn.Module, num_stages: int, rank: int):
     """Build rank-local module shard for scratch PP."""
-    return build_stage_module(
-        model,
-        num_stages,
-        rank,
-    )
+    return build_stage_module(model, num_stages, rank)
 
 
-def build_pytorch_stage(
-    model: torch.nn.Module,
-    rank: int,
-    device: torch.device,
-    pp_group,
-):
+def build_pytorch_stage(model: torch.nn.Module, rank: int, device: torch.device, pp_group):
     """Build a manual PipelineStage for PyTorch PP.
 
-    The automatic `pipeline(...)` frontend traces the full graph and then infers
+    The automatic `pipeline(...)` frontend traces the full graph and infers
     stage boundaries. On this DistilBERT classifier path it fails during
     backward setup with `Backward of skip connections not supported yet`.
-    Manual stage construction keeps the cross-stage graph linear by explicitly
-    returning `(hidden_states, attention_mask)` between stages.
+
+    Manual stage construction avoids that frontend and lets us keep the stage
+    split explicit while delegating the execution schedule to PyTorch.
     """
-    stage_module = build_stage_module(
-        model,
-        dist.get_world_size(pp_group),
-        rank,
-    )
+    stage_module = build_stage_module(model, dist.get_world_size(pp_group), rank)
     stage_module = stage_module.to(device)
-    stage = PipelineStage(
-        stage_module,
-        rank,
-        dist.get_world_size(pp_group),
-        device,
-        group=pp_group,
-    )
+    stage = PipelineStage(stage_module, rank, dist.get_world_size(pp_group), device, group=pp_group)
     return stage
 
 
@@ -222,13 +192,16 @@ def pp_loss_fn(outputs, labels, attention_mask=None):
 
 
 if __name__ == "__main__":
-    set_seed(SEED)
     ddp_initialize()
     global_rank, world_size, local_rank = get_dist_info()
     pp_group = dist.group.WORLD
     pp_rank = dist.get_rank(pp_group)
+    # Set different seed for each stage
+    set_seed(SEED + pp_rank)
     pp_world_size = dist.get_world_size(pp_group)
     per_stage_batch = GLOBAL_BATCH_SIZE
+
+    # Use static data shapes for scratch implementation
     use_static_shapes = args.pp_choice in {"naive_pp", "gpipe_pp", "1f1b_pp"}
     pp_tokenizer = get_pp_tokenizer()
     print(f"Rank: {global_rank}, World Size: {world_size}, Local Rank: {local_rank}")
@@ -319,7 +292,6 @@ if __name__ == "__main__":
             device=device,
         )
         engine = ScratchPPEngine(pipeline_impl=naive_pp_pipeline)
-
     elif args.pp_choice == "gpipe_pp":
         stage_module = split_model_for_scratch(model, num_stages, pp_rank).to(device)
         optimizer = torch.optim.AdamW(stage_module.parameters(), lr=5e-5)

@@ -69,9 +69,9 @@ class OneFOneBPipeline(BasePipeline):
         act_dtype=torch.float32,
         device=None,
     ):
-        super().__init__(stage, num_stages, module, optimizer, loss_fn, num_microbatches)
-        self.pp_group = pp_group
-        self.device = device if device is not None else torch.device(f"cuda:{stage}")
+        super().__init__(
+            stage, num_stages, module, optimizer, loss_fn, num_microbatches, pp_group, device
+        )
         self.activation_recv_buffers = [
             torch.empty(in_shape, dtype=act_dtype, device=self.device) if in_shape else None
             for _ in range(self.num_microbatches)
@@ -80,40 +80,8 @@ class OneFOneBPipeline(BasePipeline):
             torch.empty(grad_shape, dtype=act_dtype, device=self.device) if grad_shape else None
             for _ in range(self.num_microbatches)
         ]
-        self._saved_input = [None] * self.num_microbatches
-        self._saved_output = [None] * self.num_microbatches
-        self._p2p_initialized = False
 
-    # ── P2P initialization ──────────────────────────────────────────
-
-    def _initialize_p2p(self) -> None:
-        """Pre-warm NCCL P2P channels by exchanging dummy tensors with neighbors.
-
-        Following PyTorch's ``_get_init_p2p_neighbors_ops``: the first
-        ``batch_isend_irecv`` on a communicator must involve ALL ranks so that
-        NCCL can lazily create the P2P channels without deadlocking.  We send a
-        small dummy in both directions (fwd & bwd) between every pair of
-        adjacent stages in one batched call.
-        """
-        if self._p2p_initialized:
-            return
-        dummy = torch.zeros(1, device=self.device)
-        ops: list[dist.P2POp] = []
-        # Forward direction: recv from prev, send to next
-        if not self.is_first:
-            ops.append(dist.P2POp(dist.irecv, dummy.clone(), self.stage - 1, self.pp_group))
-        if not self.is_last:
-            ops.append(dist.P2POp(dist.isend, dummy.clone(), self.stage + 1, self.pp_group))
-        # Backward direction: recv from next, send to prev
-        if not self.is_last:
-            ops.append(dist.P2POp(dist.irecv, dummy.clone(), self.stage + 1, self.pp_group))
-        if not self.is_first:
-            ops.append(dist.P2POp(dist.isend, dummy.clone(), self.stage - 1, self.pp_group))
-        self._exec_p2p(ops)
-        self._p2p_initialized = True
-
-    # ── P2P helpers (build ops, don't execute) ────────────────────────
-
+    # Communication helpers
     def _fwd_recv_ops(self, micro_batch_idx: int) -> list[dist.P2POp]:
         """Return irecv op for receiving activation from prev stage."""
         if self.is_first:
@@ -151,8 +119,7 @@ class OneFOneBPipeline(BasePipeline):
         for req in reqs:
             req.wait()
 
-    # ── Compute helpers (no communication) ────────────────────────────
-
+    # Computation helpers
     def _forward_compute(self, micro_batch_idx: int, micro_batches: list[dict]) -> None:
         """Run forward computation for one microbatch (no P2P)."""
         micro_batch = micro_batches[micro_batch_idx]
@@ -200,6 +167,9 @@ class OneFOneBPipeline(BasePipeline):
 
         self._initialize_p2p()
         self.stage_opt.zero_grad(set_to_none=True)
+
+        self._saved_input = [None] * self.num_microbatches
+        self._saved_output = [None] * self.num_microbatches
 
         assert batch["input_ids"].size(0) % self.num_microbatches == 0, (
             "Batch size must be divisible by num_microbatches"

@@ -40,9 +40,9 @@ class GPipePipeline(BasePipeline):
         act_dtype=torch.float32,
         device=None,
     ):
-        super().__init__(stage, num_stages, module, optimizer, loss_fn, num_microbatches)
-        self.pp_group = pp_group
-        self.device = device if device is not None else torch.device(f"cuda:{stage}")
+        super().__init__(
+            stage, num_stages, module, optimizer, loss_fn, num_microbatches, pp_group, device
+        )
         self.activation_recv_buffers = [
             torch.empty(in_shape, dtype=act_dtype, device=self.device) if in_shape else None
             for _ in range(self.num_microbatches)
@@ -51,30 +51,6 @@ class GPipePipeline(BasePipeline):
             torch.empty(grad_shape, dtype=act_dtype, device=self.device) if grad_shape else None
             for _ in range(self.num_microbatches)
         ]
-        self._saved_input = [None] * self.num_microbatches
-        self._saved_output = [None] * self.num_microbatches
-        self.losses = [None] * self.num_microbatches
-        self._p2p_initialized = False
-
-    def _initialize_p2p(self) -> None:
-        """Pre-warm NCCL P2P channels with dummy tensors to avoid lazy-init deadlocks."""
-        if self._p2p_initialized:
-            return
-        dummy = torch.zeros(1, device=self.device)
-        ops: list[dist.P2POp] = []
-        if not self.is_first:
-            ops.append(dist.P2POp(dist.irecv, dummy.clone(), self.stage - 1, self.pp_group))
-        if not self.is_last:
-            ops.append(dist.P2POp(dist.isend, dummy.clone(), self.stage + 1, self.pp_group))
-        if not self.is_last:
-            ops.append(dist.P2POp(dist.irecv, dummy.clone(), self.stage + 1, self.pp_group))
-        if not self.is_first:
-            ops.append(dist.P2POp(dist.isend, dummy.clone(), self.stage - 1, self.pp_group))
-        if ops:
-            reqs = dist.batch_isend_irecv(ops)
-            for r in reqs:
-                r.wait()
-        self._p2p_initialized = True
 
     def _recv(self, buf: torch.Tensor, src: int) -> torch.Tensor:
         """Receive a tensor from `src` into a preallocated buffer.
@@ -127,6 +103,9 @@ class GPipePipeline(BasePipeline):
         self._initialize_p2p()
         self.stage_opt.zero_grad(set_to_none=True)
 
+        self._saved_input = [None] * self.num_microbatches
+        self._saved_output = [None] * self.num_microbatches
+        self.losses = [None] * self.num_microbatches
         # Chunk the batch into microbatches and perform forward and backward pass
         # for each microbatch sequentially.
         # Simplicity assumption microbatches is divisible by batch size
@@ -217,6 +196,7 @@ class GPipePipeline(BasePipeline):
         # Optimizer step for particular stage
         with torch.profiler.record_function("pp.optimizer_step"):
             self.stage_opt.step()
+        # Free the activation memory
         self._saved_input = [None] * self.num_microbatches
         self._saved_output = [None] * self.num_microbatches
         final_loss = None

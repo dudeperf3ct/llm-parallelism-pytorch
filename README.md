@@ -8,7 +8,7 @@ Model choice by experiment:
 
 * Data Parallelism write up: https://dudeperf3ct.github.io/posts/implement_data_parallelism/
 * Sharding write up: https://dudeperf3ct.github.io/posts/implement_sharding/
-* Pipeline Parallelism write up: 
+* Pipeline Parallelism write up: https://dudeperf3ct.github.io/posts/implement_pipeline_parallelism/
 
 ## Costs
 

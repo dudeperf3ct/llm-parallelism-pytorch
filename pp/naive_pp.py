@@ -37,9 +37,9 @@ class NaivePipeline(BasePipeline):
         act_dtype=torch.float32,
         device=None,
     ):
-        super().__init__(stage, num_stages, module, optimizer, loss_fn, num_microbatches)
-        self.pp_group = pp_group
-        self.device = device if device is not None else torch.device(f"cuda:{stage}")
+        super().__init__(
+            stage, num_stages, module, optimizer, loss_fn, num_microbatches, pp_group, device
+        )
         # Placeholders used to recieve
         self.activation_recv_buffer = (
             torch.empty(in_shape, dtype=act_dtype, device=self.device) if in_shape else None
@@ -47,10 +47,6 @@ class NaivePipeline(BasePipeline):
         self.gradient_recv_buffer = (
             torch.empty(grad_shape, dtype=act_dtype, device=self.device) if grad_shape else None
         )
-        # Responsible for peak memory
-        self._saved_input = None
-        self._saved_output = None
-        self.loss = None
         self._p2p_initialized = False
 
     def _initialize_p2p(self) -> None:
@@ -121,10 +117,21 @@ class NaivePipeline(BasePipeline):
 
         self._initialize_p2p()
         self.stage_opt.zero_grad(set_to_none=True)
+        # Responsible for peak memory
+        self._saved_input = None
+        self._saved_output = None
         self.loss = None
 
         def forward_step() -> None:
-            """Run stage-local forward for the single microbatch."""
+            """Run stage-local forward for the single microbatch.
+
+            We save stage boundary input activations required for calculating gradients.
+            - Stage 0 (first): saves only `self._saved_output` (its forward output activation).
+            - Middle stages: save both
+              - `self._saved_input` = activation received from previous stage (with `requires_grad`)
+              - `self._saved_output` = activation sent to next stage.
+            - Last stage: saves `self._saved_input` (received activation) and `self.loss`, not `_saved_output`.
+            """
             # First stage, we run the forward pass on the input batch
             # and send the activations to the next stage.
             if self.is_first:
@@ -192,8 +199,11 @@ class NaivePipeline(BasePipeline):
         # Optimizer step for particular stage
         with torch.profiler.record_function("pp.optimizer_step"):
             self.stage_opt.step()
+
+        # Free the space taken by saved activation
         self._saved_input = None
         self._saved_output = None
+        # Calculate final loss
         final_loss = self.loss.item() if self.is_last and self.loss is not None else None
         self.loss = None
         return final_loss
