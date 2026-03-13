@@ -12,12 +12,11 @@ Model choice by experiment:
 
 ## Costs
 
-**DDP**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.79/hour as of December 2025. It costs about $2.25 to complete these experiments.
+**DDP**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.79/hour as of December 2025. It costs about $2.25 to run ddp script.
 
-**Sharding**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.78/hour as of Feburary 2026. It costs about $2 to complete these experiments.
+**Sharding**: I used a 2 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $0.78/hour as of Feburary 2026. It costs about $2 to run the sharding script.
 
-**Pipeline**: I used a 3 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $1.18/hour as of March 2026.
-
+**Pipeline**: I used a 3 x Nvidia L4 (24 GB) instance using the Run Pod platform to run these experiments. It costs around $1.18/hour as of March 2026. It costs about $2 to run pipelin parallelism script.
 
 ## Requirements
 
